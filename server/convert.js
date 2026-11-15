@@ -100,6 +100,7 @@ export async function convertPreparedJob(job, runProcess) {
   fs.rmSync(job.sourcePath, { force: true });
   job.sourcePath = null;
   job.outputStreamId = stream.streamId;
+  job.reservedBytes = 0;
   job.status = 'done';
   job.progress = 100;
   job.message = 'Conversion complete';

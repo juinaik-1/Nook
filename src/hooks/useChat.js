@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { supabase } from '../supabase';
+import { sliceGraphemes } from '../utils/graphemes';
 
 function toListMessage(message) {
   return {
@@ -9,8 +10,19 @@ function toListMessage(message) {
     text: message.text || '',
     created_at: message.created_at || new Date().toISOString(),
     type: message.type || 'chat',
+    // The database row only carries the display name. The broadcast carries the
+    // participant id as well, so a message is grouped with the right person
+    // when it arrives live.
     user_id: message.user_id || message.name || 'guest',
   };
+}
+
+// Append without repeating a message that is already listed. The same
+// message arrives twice: once through the broadcast and once through the
+// database change feed.
+function appendMessage(current, message) {
+  if (current.some((entry) => entry.id === message.id)) return current;
+  return [...current, message].slice(-100);
 }
 
 export function useChat({ roomId, channel, displayName, userId }) {
@@ -38,7 +50,7 @@ export function useChat({ roomId, channel, displayName, userId }) {
         created_at: payload.created_at || new Date().toISOString(),
       });
 
-      setMessages((current) => [...current, message].slice(-100));
+      setMessages((current) => appendMessage(current, message));
     };
 
     const handleNotice = ({ payload }) => {
@@ -81,7 +93,7 @@ export function useChat({ roomId, channel, displayName, userId }) {
         .from('messages')
         .select('*')
         .eq('room_id', roomId)
-        .order('created_at', { ascending: true })
+        .order('created_at', { ascending: false })
         .limit(100);
 
       if (error) {
@@ -90,7 +102,10 @@ export function useChat({ roomId, channel, displayName, userId }) {
       }
 
       if (!active) return;
-      const history = (data || []).map(toListMessage);
+      // The query returns the newest first, so reverse it to keep the list
+      // oldest-first for display. Without this a busy room would show the
+      // oldest 100 messages and never the recent ones.
+      const history = (data || []).map(toListMessage).reverse();
       setMessages((current) => {
         const byId = new Map(history.map((message) => [message.id, message]));
         current.forEach((message) => byId.set(message.id, message));
@@ -114,7 +129,7 @@ export function useChat({ roomId, channel, displayName, userId }) {
         },
         (payload) => {
           const nextMessage = toListMessage(payload.new);
-          setMessages((current) => [...current, nextMessage].slice(-100));
+          setMessages((current) => appendMessage(current, nextMessage));
         },
       )
       .subscribe();
@@ -151,7 +166,7 @@ export function useChat({ roomId, channel, displayName, userId }) {
       return;
     }
 
-    const cleanedText = messageText.slice(0, 500);
+    const cleanedText = sliceGraphemes(messageText, 500);
     const payload = {
       room_id: roomId,
       name: displayName || 'Guest',

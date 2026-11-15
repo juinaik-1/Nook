@@ -15,11 +15,6 @@ export function normalizeVideoUrl(rawValue) {
   }
 }
 
-export function escapePlainText(value) {
-  return String(value ?? '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#039;');
-}
+// escapePlainText removed: React already escapes text nodes safely, so
+// pre-escaping only double-encoded the characters (e.g. apostrophes became
+// "&#039;"). Keep this comment so the history of the change is visible.

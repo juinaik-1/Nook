@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import {
   AlertCircle,
@@ -12,6 +12,7 @@ import {
 } from 'lucide-react';
 import Chat from '../components/Chat';
 import DriveSource from '../components/DriveSource';
+import QueuePanel from '../components/QueuePanel';
 import RecentConversions from '../components/RecentConversions';
 import UserList from '../components/UserList';
 import VideoPlayer from '../components/VideoPlayer';
@@ -21,9 +22,12 @@ import { useChat } from '../hooks/useChat';
 import { useAuth } from '../context/AuthContext';
 import { useRoomChannel } from '../hooks/useRoomChannel';
 import { useTheme } from '../hooks/useTheme';
+import { useQueue } from '../hooks/useQueue';
+import { isConversionRequired } from '../utils/platforms';
 import { useVideoSync } from '../hooks/useVideoSync';
 import { useVoice } from '../hooks/useVoice';
 import { cn } from '../utils/cn';
+import { resolveDisplayNames } from '../utils/displayNames';
 import { acknowledgeConvertedVideo, getConvertRequestId, openConvertTab, subscribeConvertedVideo } from '../utils/roomBridge';
 
 const DISPLAY_NAME_KEY = 'Nook-display-name';
@@ -84,6 +88,19 @@ export default function Room() {
   const isHost = hostId === userId;
   const canControl = !hostOnlyControls || isHost;
 
+  // Two guests both get the default name, and two people can share a name.
+  // Every client resolves the same list the same way, so the room shows
+  // "Guest" and "Guest 2", or "Alex" and "Alex 2".
+  const displayNames = useMemo(() => resolveDisplayNames(presenceUsers), [presenceUsers]);
+  const myDisplayName = displayNames.get(userId) || displayName || 'Guest';
+  const peopleWithNames = useMemo(
+    () => presenceUsers.map((participant) => ({
+      ...participant,
+      name: displayNames.get(participant.userId) || participant.name || 'Guest',
+    })),
+    [presenceUsers, displayNames],
+  );
+
   useEffect(() => {
     // The host owns the toggle and updates presence itself. Letting presence
     // sync write back would clobber an optimistic toggle with a stale value,
@@ -103,12 +120,39 @@ export default function Room() {
   // tabs, not exclusive to this one.
   const convertRequestId = useRef('');
   if (!convertRequestId.current) convertRequestId.current = getConvertRequestId(roomKey);
+  // Tracks when the current video actually started playing, so a spurious
+  // onEnded (e.g. a load hiccup) does not wipe the queue.
+  const playStartedAtRef = useRef(0);
   // The conversion tab, so the room can confirm it picked up the video.
   const convertWindowRef = useRef(null);
   // The stream handed over by the conversion tab. Every load mints a new
   // signed URL and restarts the playback, so the same stream is only applied
   // once.
   const appliedConvertRef = useRef('');
+
+  const queue = useQueue({
+    roomId: roomKey,
+    channel,
+    isConnected,
+    send,
+    canControl,
+    userId,
+  });
+  const queueRef = useRef(queue);
+  queueRef.current = queue;
+
+  // Host-dependent auto-advance fallback. When a non-host controller's video
+  // ends, wait 5s for the host to advance; otherwise advance locally.
+  const advanceFallbackTimer = useRef(null);
+  const clearAdvanceFallback = useCallback(() => {
+    if (advanceFallbackTimer.current) {
+      window.clearTimeout(advanceFallbackTimer.current);
+      advanceFallbackTimer.current = null;
+    }
+  }, []);
+  useEffect(() => {
+    clearAdvanceFallback();
+  }, [queue.version, clearAdvanceFallback]);
 
   const video = useVideoSync({
     roomId: roomKey,
@@ -120,6 +164,29 @@ export default function Room() {
     hostId,
     userId,
   });
+
+  useEffect(() => {
+    if (video.playing) playStartedAtRef.current = Date.now();
+  }, [video.playing]);
+
+  // Move the room to the next queued item. The backend advance is idempotent
+  // (it only removes the item if it is still the head), so a host and a
+  // fallback guest cannot double-skip.
+  const playNextQueued = useCallback(async () => {
+    if (!canControl) return;
+    const items = queueRef.current?.items || [];
+    if (!items.length) return;
+    // The item that just finished is the one the room was playing. When the
+    // playing video is not in the queue, nothing is removed and the head
+    // simply starts playing.
+    const finished = items.find((item) =>
+      (item.streamId && item.streamId === video.streamId)
+      || (item.url && item.url === video.url),
+    );
+    const result = await queueRef.current.advance(finished?.id);
+    if (!result?.head) return;
+    video.playQueueItem?.(result.head);
+  }, [canControl, video.playQueueItem, video.streamId, video.url]);
 
   useEffect(() => {
     if (isConnected) video.requestState();
@@ -152,6 +219,18 @@ export default function Room() {
         confirm();
         return;
       }
+      // Upgrade any pending queue item that this conversion fulfils.
+      const q = queueRef.current;
+      const pendingItem = (q?.items || []).find((item) =>
+        item.status === 'pending'
+        && (item.jobId === message.jobId || (message.url && item.url === message.url)),
+      );
+      if (pendingItem) {
+        const upgradedTitle = (message.name && message.name.trim() && message.name !== 'Converted video' && !/\\.(com|net|org)$/i.test(message.name.trim()))
+          ? message.name.trim()
+          : pendingItem.title;
+        void q.patch(pendingItem.id, { kind: 'stream', streamId: message.streamId, jobId: message.jobId, status: 'ready', title: upgradedTitle }).catch(() => {});
+      }
       const applyVideo = async () => {
         // Claim it before the request goes out, so a repeated message cannot
         // start a second load of the same stream.
@@ -179,12 +258,15 @@ export default function Room() {
   }, [roomKey, canControl, video.shareConvertedVideo]);
 
   // Open the conversion page in a separate tab so the room keeps playing.
-  const openConverter = (stream) => {
+  const openConverter = (streamOrPayload) => {
+    const payload = streamOrPayload || {};
     convertWindowRef.current = openConvertTab({
       roomId: roomKey,
       requestId: convertRequestId.current,
-      streamId: stream?.streamId,
-      name: stream?.name,
+      streamId: payload.streamId,
+      name: payload.name,
+      url: payload.url,
+      auto: payload.auto,
     });
   };
 
@@ -208,7 +290,7 @@ export default function Room() {
     }
   }, [location.key, location.state, navigate, roomKey, video.loadStream]);
 
-  const chat = useChat({ roomId: roomKey, channel, displayName, userId });
+  const chat = useChat({ roomId: roomKey, channel, displayName: myDisplayName, userId });
   const voice = useVoice({
     roomId: roomKey,
     channel,
@@ -365,14 +447,72 @@ export default function Room() {
               onDuration={video.handleDuration}
               onLoadVideo={video.loadVideo}
               onReady={video.handleReady}
-              onVideoError={video.handleVideoError}
+              onVideoError={(message) => {
+                video.handleVideoError?.(message);
+                if (!canControl || !queue.items.length) return;
+                const head = queue.items[0];
+                // Only treat it as a queue failure if the errored video is the
+                // queued head, so a transient error on an unrelated video does
+                // not wipe the queue.
+                const matchesHead = (head.streamId && head.streamId === video.streamId)
+                  || (head.url && head.url === video.url);
+                if (!matchesHead) return;
+                (async () => {
+                  try { await queue.patch(head.id, { status: 'failed' }); } catch { /* ignore */ }
+                  // The advance removes the failed head and hands back the
+                  // next one, so the failed item is not played.
+                  try {
+                    const result = await queue.advance(head.id);
+                    if (result?.advanced && result.head) video.playQueueItem?.(result.head);
+                  } catch { /* ignore */ }
+                })();
+              }}
               onConvert={openConverter}
+              onPlayNext={() => { void playNextQueued(); }}
+              hasQueueItems={queue.items.length > 0}
+              onQueueAdd={async (normalized) => {
+                try {
+                  if (isConversionRequired(normalized)) {
+                    await queue.add({ kind: 'job', url: normalized, title: null, status: 'pending', addedBy: userId });
+                    openConverter({ url: normalized, auto: true });
+                  } else {
+                    await queue.add({ kind: 'url', url: normalized, title: null, status: 'ready', addedBy: userId });
+                  }
+                } catch (error) {
+                  // Surface via the player's local error is not available here;
+                  // the queue panel will show it on next interaction.
+                  console.error('Unable to queue video:', error?.message || error);
+                }
+              }}
+              onEnded={() => {
+                if (!canControl || !queue.items.length) return;
+                // Ignore spurious ended events fired right after a load.
+                if (Date.now() - playStartedAtRef.current < 3000) return;
+                if (isHost) {
+                  void playNextQueued();
+                } else {
+                  // The host normally advances. Give it a few seconds, then
+                  // do it ourselves. The backend advance is idempotent.
+                  clearAdvanceFallback();
+                  advanceFallbackTimer.current = window.setTimeout(() => {
+                    void playNextQueued();
+                  }, 5000);
+                }
+              }}
             />
 
             {user ? (
               <>
                 <DriveSource
-                  onLoadStream={video.loadStream}
+                  onLoadStream={(stream) => {
+                    const nearEnd = Boolean(video.duration && video.duration > 0 && (video.duration - (video.roomTime || 0)) <= 5);
+                    const shouldQueue = Boolean(video.url || video.streamId) && video.playing && !nearEnd;
+                    if (shouldQueue && stream?.streamId) {
+                      void queue.add({ kind: 'stream', streamId: stream.streamId, title: stream.name || 'Drive video', status: 'ready', addedBy: userId });
+                      return;
+                    }
+                    video.loadStream?.(stream);
+                  }}
                   onConvert={openConverter}
                 />
                 <RecentConversions onPlay={playRecentConversion} />
@@ -382,6 +522,27 @@ export default function Room() {
                 Guest mode: you can watch, chat, and join voice. Sign in to use Drive or convert videos.
               </p>
             )}
+            <QueuePanel
+              queue={queue}
+              canControl={canControl}
+              participantId={userId}
+              people={peopleWithNames}
+              roomId={roomKey}
+              requestId={convertRequestId.current}
+              currentUrl={video.url}
+              currentStreamId={video.streamId}
+              currentStreamName={video.streamName}
+              onPlayCurrent={async (item) => {
+                if (item?.streamId) {
+                  await video.loadStream?.({ streamId: item.streamId, name: item.title || 'Queued video' });
+                } else if (item?.url) {
+                  video.loadVideo?.(item.url);
+                }
+                if (canControl) {
+                  window.setTimeout(() => video.playNow?.(), 150);
+                }
+              }}
+            />
 
             <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-zinc-200/80 bg-white px-3 py-2.5 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
               {isHost ? (
@@ -410,7 +571,7 @@ export default function Room() {
             />
 
             <UserList
-              users={presenceUsers}
+              users={peopleWithNames}
               hostId={hostId}
               currentUserId={userId}
               onTransferHost={(targetUserId) => transferHost(targetUserId, hostOnlyControls)}
@@ -424,7 +585,7 @@ export default function Room() {
             messages={chat.messages}
             onSendMessage={chat.sendMessage}
             currentUserId={userId}
-            displayName={displayName}
+            displayName={myDisplayName}
             className="h-[560px] min-h-[420px] lg:sticky lg:top-[72px] lg:h-[calc(100vh-88px)]"
           />
         </div>

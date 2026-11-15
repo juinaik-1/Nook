@@ -4,6 +4,7 @@ import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import { config, ensureDataDirectories } from "./config.js";
 import {
+  attachSession,
   authenticateGoogleIdToken,
   issueSessionToken,
   requireSession,
@@ -20,19 +21,32 @@ import {
   cleanupExpiredJobs,
   createJob,
   getJob,
+  getUserReservedBytes,
   requestJobConversion,
 } from "./jobs.js";
 import {
+  deleteAllUserStreams,
   deleteExpiredStreams,
   deleteStream,
   getStream,
   getStreamAccess,
   getUserActiveStreams,
+  getUserStorageUsed,
   registerDriveStream,
   serveStream,
 } from "./streams.js";
 import { startDiskCleanup } from "./cleanup.js";
-import { isValidJobId, isValidStreamId } from "./security.js";
+import { isValidJobId, isValidStreamId, validateUrl } from "./security.js";
+import {
+  addQueueItem,
+  advanceQueue,
+  cleanupExpiredQueues,
+  clearQueue,
+  getQueue,
+  isValidRoomId,
+  patchQueueItem,
+  removeQueueItem,
+} from "./queues.js";
 
 ensureDataDirectories();
 
@@ -50,7 +64,7 @@ app.use(cors({
     }
     return callback(new Error('Blocked by CORS'));
   },
-  methods: ['GET', 'HEAD', 'POST', 'DELETE', 'OPTIONS'],
+  methods: ['GET', 'HEAD', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Authorization', 'Content-Type', 'Range', 'Access-Control-Request-Private-Network'],
   exposedHeaders: ['Accept-Ranges', 'Content-Range', 'Content-Length'],
   credentials: true,
@@ -97,8 +111,17 @@ const apiLimiter = rateLimit({
   legacyHeaders: false,
   // Range requests for the media are not API calls. Counting them used to let
   // a single viewer exhaust the budget and rate limit the session check.
-  skip: (req) => req.path.startsWith("/stream/"),
+  // The queue has its own budget: every participant polls it when the queue
+  // changes, and behind a reverse proxy all of them share one address.
+  skip: (req) => req.path.startsWith("/stream/") || req.path.startsWith("/rooms/"),
   message: { error: "Too many API requests. Try again shortly." },
+});
+const queueLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: config.rateLimits.queue,
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  message: { error: "Too many queue requests. Try again shortly." },
 });
 
 app.use("/api/auth", authLimiter);
@@ -109,13 +132,20 @@ app.use("/api", (req, res, next) => {
   if (req.method === "OPTIONS") return next();
 
   const cleanPath = req.path.replace(/\/+$/, "");
+  // The queue routes are: /rooms/:roomId/queue, /rooms/:roomId/queue/advance
+  // and /rooms/:roomId/queue/:itemId. The item id segment needs its own
+  // slash, otherwise PATCH and DELETE on an item were treated as protected
+  // routes and a guest was told to sign in.
+  const isQueueRoute = /^\/rooms\/[A-Z0-9]{4,8}\/queue(\/advance|\/[a-f0-9]{32})?$/i.test(cleanPath);
   const isPublic =
     cleanPath === "/health" ||
     (cleanPath === "/auth/google" && req.method === "POST") ||
     (cleanPath === "/auth/google/callback" && req.method === "GET") ||
     /^\/streams\/[a-f0-9]{32}\/access$/i.test(cleanPath) ||
-    (cleanPath.startsWith("/stream/") && ["GET", "HEAD"].includes(req.method));
+    (cleanPath.startsWith("/stream/") && ["GET", "HEAD"].includes(req.method)) ||
+    (isQueueRoute && req.method === "GET");
 
+  if (isQueueRoute) return attachSession(req, res, next);
   return isPublic ? next() : requireSession(req, res, next);
 });
 
@@ -225,6 +255,28 @@ app.post("/api/streams/:streamId/access", (req, res) => {
     ? res.json(result)
     : res.status(404).json({ error: "Stream not found or expired." });
 });
+// How much storage this account has used and how much it is allowed. The
+// numbers come from the stream registry and the in-flight jobs, so no
+// database is involved.
+app.get("/api/storage", (req, res) =>
+  res.json({
+    usedBytes: getUserStorageUsed(req.user.id),
+    reservedBytes: getUserReservedBytes(req.user.id),
+    quotaBytes: config.perUserQuotaBytes,
+    fileCount: getUserActiveStreams(req.user.id).length,
+  }),
+);
+// Drop every converted video this account still has. The user reaches for
+// this when they are over quota or want a clean slate. The file is removed
+// where it can be; a file a live stream still serves is left for the cleanup
+// sweep.
+app.delete("/api/streams/mine", (req, res) => {
+  const result = deleteAllUserStreams(req.user.id);
+  return res.json({
+    deleted: result.deleted,
+    bytesFreed: result.bytesFreed,
+  });
+});
 app.delete("/api/streams/:streamId", (req, res) => {
   if (!isValidStreamId(req.params.streamId))
     return res.status(400).json({ error: "Invalid stream ID." });
@@ -290,6 +342,125 @@ app.delete("/api/jobs/:jobId", (req, res) => {
     : res.status(404).json({ error: "Job not found." });
 });
 
+// Room playback queue. The backend owns it so requireSession gives real
+app.get("/api/rooms/:roomId/queue", queueLimiter, async (req, res, next) => {
+  if (!isValidRoomId(req.params.roomId)) return res.status(400).json({ error: "Invalid room ID." });
+  try {
+    return res.json(await getQueue(req.params.roomId.toUpperCase()));
+  } catch (error) { return next(error); }
+});
+app.post("/api/rooms/:roomId/queue", queueLimiter, async (req, res, next) => {
+  if (!isValidRoomId(req.params.roomId)) return res.status(400).json({ error: "Invalid room ID." });
+  try {
+    const body = req.body || {};
+    const kind = body.kind;
+    if (!['url', 'stream', 'job'].includes(kind)) {
+      return res.status(400).json({ error: "kind must be url, stream, or job." });
+    }
+    const actorId = (typeof body.addedBy === 'string' && body.addedBy.trim())
+      ? body.addedBy.trim().slice(0, 64)
+      : req.user?.id;
+    if (!actorId) {
+      return res.status(400).json({ error: "A participant id is required to add to the queue." });
+    }
+    // Only valid HTTP(S) URLs may be queued.
+    if ((kind === 'url' || kind === 'job') && typeof body.url === 'string' && body.url.trim()) {
+      try { validateUrl(body.url.trim()); } catch (validationError) {
+        return res.status(400).json({ error: validationError.message || "Enter a valid HTTP or HTTPS URL." });
+      }
+    } else if (kind === 'url' || kind === 'job') {
+      return res.status(400).json({ error: "A valid url is required." });
+    }
+    if (kind === 'job') {
+      const current = await getQueue(req.params.roomId.toUpperCase());
+      const userPending = current.items.filter(
+        (item) => item.kind === 'job' && item.addedBy === actorId && item.status === 'pending',
+      ).length;
+      if (userPending >= 1) {
+        return res.status(409).json({ error: "You already have a conversion in progress in this queue." });
+      }
+    }
+    if (kind === 'stream') {
+      const streamId = body.streamId;
+      if (typeof streamId !== 'string' || !/^[a-f0-9]{32}$/.test(streamId)) {
+        return res.status(400).json({ error: "A valid streamId is required." });
+      }
+      const record = getStream(streamId);
+      // A guest owns no streams, so only a signed-in owner may queue one.
+      if (!req.user || !record || record.ownerUserId !== req.user.id) {
+        return res.status(403).json({ error: "Only the stream owner can queue it." });
+      }
+    }
+    const result = await addQueueItem(req.params.roomId.toUpperCase(), {
+      kind,
+      url: body.url,
+      streamId: body.streamId,
+      jobId: body.jobId,
+      title: body.title,
+      author: body.author,
+      thumbnailUrl: body.thumbnailUrl,
+      addedBy: actorId,
+      status: body.status,
+    }, body.expectedVersion);
+    return res.status(201).json(result);
+  } catch (error) {
+    return next(error);
+  }
+});
+app.patch("/api/rooms/:roomId/queue/:itemId", queueLimiter, async (req, res, next) => {
+  if (!isValidRoomId(req.params.roomId)) return res.status(400).json({ error: "Invalid room ID." });
+  if (!/^[a-f0-9]{32}$/.test(req.params.itemId)) return res.status(400).json({ error: "Invalid item ID." });
+  try {
+    const result = await patchQueueItem(
+      req.params.roomId.toUpperCase(),
+      req.params.itemId,
+      req.body || {},
+      req.body?.expectedVersion,
+    );
+    return res.json(result);
+  } catch (error) {
+    return next(error);
+  }
+});
+app.delete("/api/rooms/:roomId/queue/:itemId", queueLimiter, async (req, res, next) => {
+  if (!isValidRoomId(req.params.roomId)) return res.status(400).json({ error: "Invalid room ID." });
+  if (!/^[a-f0-9]{32}$/.test(req.params.itemId)) return res.status(400).json({ error: "Invalid item ID." });
+  try {
+    const result = await removeQueueItem(
+      req.params.roomId.toUpperCase(),
+      req.params.itemId,
+      req.body?.expectedVersion,
+    );
+    return res.json(result);
+  } catch (error) {
+    return next(error);
+  }
+});
+app.delete("/api/rooms/:roomId/queue", queueLimiter, async (req, res, next) => {
+  if (!isValidRoomId(req.params.roomId)) return res.status(400).json({ error: "Invalid room ID." });
+  try {
+    return res.json(await clearQueue(req.params.roomId.toUpperCase(), req.body?.expectedVersion));
+  } catch (error) {
+    return next(error);
+  }
+});
+
+// Idempotent advance: only advances if finishedItemId is still at the head.
+app.post("/api/rooms/:roomId/queue/advance", queueLimiter, async (req, res, next) => {
+  if (!isValidRoomId(req.params.roomId)) return res.status(400).json({ error: "Invalid room ID." });
+  try {
+    const finishedItemId = req.body?.finishedItemId;
+    const result = await advanceQueue(
+      req.params.roomId.toUpperCase(),
+      finishedItemId,
+      req.body?.expectedVersion,
+    );
+    return res.json(result);
+  } catch (error) {
+    return next(error);
+  }
+});
+
 app.use((error, _req, res, _next) => {
   const status = Number(error.status || error.statusCode || 500);
   // Log the real cause so a masked 500 can be diagnosed from the console.
@@ -320,6 +491,7 @@ const cleanupTimer = setInterval(() => {
   try {
     cleanupExpiredJobs();
     deleteExpiredStreams();
+    cleanupExpiredQueues();
   } catch {
     console.error("Scheduled expired-file cleanup failed.");
   }
@@ -330,6 +502,7 @@ cleanupTimer.unref?.();
 startDiskCleanup();
 cleanupExpiredJobs();
 deleteExpiredStreams();
+cleanupExpiredQueues();
 
 app.listen(config.port, () =>
   console.log(`Nook API listening on port ${config.port}`),

@@ -12,7 +12,7 @@ import {
   lowPrioritySpawnOptions,
   prepareLowPriority,
 } from './processPriority.js';
-import { deleteStream, getStream } from './streams.js';
+import { deleteStream, getStream, getUserStorageUsed } from './streams.js';
 import {
   createJobId,
   assertMinimumFreeSpace,
@@ -47,6 +47,7 @@ function persistableJob(job) {
     outputStreamId: job.outputStreamId,
     conversionOptions: job.conversionOptions,
     requestedOptions: job.requestedOptions,
+    reservedBytes: job.reservedBytes || 0,
     createdAt: job.createdAt,
     completedAt: job.completedAt,
   };
@@ -83,6 +84,7 @@ function loadJobs() {
         error: wasRunning
           ? 'The server restarted during this conversion. Start it again.'
           : (record.error || ''),
+        reservedBytes: wasRunning ? 0 : Number(record.reservedBytes || 0),
         completedAt: wasRunning ? Date.now() : record.completedAt,
       });
     }
@@ -101,6 +103,7 @@ function setFailure(job, error) {
   job.progress = 100;
   job.message = error.message || 'Conversion failed.';
   job.error = job.message;
+  job.reservedBytes = 0;
   job.completedAt = Date.now();
   persistJobs();
 }
@@ -226,7 +229,14 @@ function spawnProcess(job, command, args, { timeoutMs, onLine, lowPriority }) {
       if (stderrRemainder) onLine(stderrRemainder);
       if (code === 0) finish();
       else if (command === 'yt-dlp') {
-        finish(new Error('The source could not be downloaded. Check the URL and try again.'));
+        const rateLimited = /429|too many requests|rate.?limit/i.test(stderrTail);
+        const ytError = new Error(rateLimited
+          ? 'The source is rate limiting our server. Try again in a few minutes.'
+          : 'The source could not be downloaded. Check the URL and try again.');
+        if (rateLimited) ytError.rateLimited = true;
+        // Keep the tail so callers can re-check if needed.
+        ytError.stderrTail = stderrTail;
+        finish(ytError);
       } else {
         const details = stderrTail
           .split(/\r?\n/)
@@ -337,7 +347,13 @@ async function downloadUrlSource(job) {
     }
   }, 500);
   try {
-    await runProcess(job, 'yt-dlp', args, {
+    const maxAttempts = 3;
+    let attempt = 0;
+    let lastError = null;
+    while (attempt < maxAttempts) {
+      attempt += 1;
+      try {
+        await runProcess(job, 'yt-dlp', args, {
       timeoutMs: 60 * 60_000,
       onLine: (line) => {
         const percent = /(\d+(?:\.\d+)?)%/.exec(line)?.[1];
@@ -347,6 +363,28 @@ async function downloadUrlSource(job) {
         }
       },
     });
+        lastError = null;
+        break;
+      } catch (error) {
+        lastError = error;
+        const rateLimited = Boolean(error?.rateLimited)
+          || /429|too many requests|rate.?limit/i.test(error?.message || '')
+          || /429|too many requests|rate.?limit/i.test(error?.stderrTail || '');
+        if (!rateLimited || attempt >= maxAttempts || job.status === 'cancelled') throw error;
+        try {
+          for (const name of fs.readdirSync(config.downloadDir)) {
+            if (name.startsWith(`${job.id}.source.`)) {
+              fs.rmSync(path.join(config.downloadDir, name), { force: true });
+            }
+          }
+        } catch { /* ignore */ }
+        const delay = 2000 * 2 ** (attempt - 1);
+        job.message = `Source is rate limiting — retrying in ${Math.round(delay / 1000)}s`;
+        await new Promise((resolve) => { const timer = setTimeout(resolve, delay); timer.unref?.(); });
+        if (job.status === 'cancelled') throw Object.assign(new Error('Conversion cancelled.'), { cancelled: true });
+      }
+    }
+    if (lastError) throw lastError;
   } catch (error) {
     if (job.downloadLimitExceeded && job.status !== 'cancelled') {
       throw new Error(`The source exceeds the ${process.env.MAX_SOURCE_GB || 5} GB download limit.`);
@@ -531,6 +569,30 @@ export async function createJob(ownerUserId, source, options = {}) {
   // source and the output at the same time, so a nearly full disk must be
   // reported here instead of failing halfway through the conversion.
   assertMinimumFreeSpace(config.minFreeDiskBytes, config.downloadDir);
+  const oneHourAgo = Date.now() - 60 * 60_000;
+  const recentCount = [...jobs.values()].filter(
+    (job) => job.ownerUserId === ownerUserId && Number(job.createdAt || 0) >= oneHourAgo,
+  ).length;
+  if (recentCount >= config.maxConversionsPerUserPerHour) {
+    const error = new Error(`You have reached the limit of ${config.maxConversionsPerUserPerHour} conversions per hour. Try again later.`);
+    error.status = 429;
+    error.exposeToUser = true;
+    throw error;
+  }
+  // Per-user storage quota. The output size is not known until the conversion
+  let reservation = config.maxSourceBytes;
+  if (source?.streamId) {
+    const record = getStream(source.streamId);
+    if (record?.size) reservation = Number(record.size);
+  }
+  const usedBytes = getUserStorageUsed(ownerUserId);
+  const reservedBytes = getUserReservedBytes(ownerUserId);
+  if (usedBytes + reservedBytes + reservation > config.perUserQuotaBytes) {
+    const error = new Error('You have reached your storage quota. Delete a converted video to free space, then try again.');
+    error.status = 429;
+    error.exposeToUser = true;
+    throw error;
+  }
   if (!source || (typeof source.streamId !== 'string' && typeof source.url !== 'string')) {
     const error = new Error('Choose a registered Drive video or provide a source URL.');
     error.status = 400;
@@ -582,6 +644,7 @@ export async function createJob(ownerUserId, source, options = {}) {
     sourcePath: null,
     sourceName: '',
     status: 'queued',
+    reservedBytes: reservation,
     message: 'Queued for conversion',
     progress: 0,
     createdAt: Date.now(),
@@ -642,6 +705,17 @@ export function getJob(id, ownerUserId) {
   return serializeJob(job);
 }
 
+// The bytes this user has reserved with in-flight conversions.
+export function getUserReservedBytes(userId) {
+  let total = 0;
+  for (const job of jobs.values()) {
+    if (job.ownerUserId !== userId) continue;
+    if (['done', 'failed', 'cancelled'].includes(job.status)) continue;
+    total += Number(job.reservedBytes || 0);
+  }
+  return total;
+}
+
 export function cancelJob(id, ownerUserId) {
   const job = jobs.get(id);
   if (!job || job.ownerUserId !== ownerUserId) return null;
@@ -649,6 +723,7 @@ export function cancelJob(id, ownerUserId) {
   job.status = 'cancelled';
   job.message = 'Conversion cancelled';
   job.error = '';
+  job.reservedBytes = 0;
   job.completedAt = Date.now();
   const index = queue.indexOf(id);
   if (index >= 0) queue.splice(index, 1);

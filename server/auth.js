@@ -51,7 +51,7 @@ export function requireSession(req, res, next) {
   const authorization = req.get('authorization') || '';
   const match = /^Bearer ([^\s]+)$/.exec(authorization);
   if (!match) {
-    return res.status(401).json({ error: 'A valid session is required.' });
+    return res.status(401).json({ error: 'Login is required.' });
   }
   try {
     const claims = jwt.verify(match[1], config.sessionSecret, {
@@ -85,4 +85,24 @@ export function verifyStreamToken(token) {
     issuer: 'Nook',
     audience: 'Nook-stream',
   });
+}
+
+export function attachSession(req, _res, next) {
+  const authorization = req.get('authorization') || '';
+  const match = /^Bearer ([^\s]+)$/.exec(authorization);
+  if (match) {
+    try {
+      const claims = jwt.verify(match[1], config.sessionSecret, {
+        algorithms: ['HS256'],
+        issuer: 'Nook',
+        audience: 'Nook-app',
+      });
+      if (typeof claims.sub === 'string' && typeof claims.email === 'string') {
+        req.user = { id: claims.sub, email: claims.email };
+      }
+    } catch {
+      // Ignore an invalid/expired token for guest-capable routes.
+    }
+  }
+  return next();
 }

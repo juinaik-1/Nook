@@ -3,6 +3,7 @@ import ReactPlayer from 'react-player';
 import { Clock, Link2, MonitorPlay, Radio, VolumeX, WandSparkles } from 'lucide-react';
 import { Badge, Button, Panel, inputClass } from './ui';
 import { normalizeVideoUrl } from '../utils/videoUrl';
+import { isConversionRequired, isEmbeddable, matchPlatform, platformLabel } from '../utils/platforms';
 import { cn } from '../utils/cn';
 
 function formatDuration(value) {
@@ -26,7 +27,7 @@ function formatTimestamp(value) {
 export default function VideoPlayer({
   url, streamId, streamName, playing, time, roomTime, duration = 0, canControl, canConvert = true,
   loading, error, syncNonce = 0, onPlayPause, onSeek, onProgress, onDuration, onLoadVideo, onVideoError, onReady,
-  onConvert,
+  onConvert, onQueueAdd, onPlayNext, onEnded, hasQueueItems = false,
 }) {
   const playerRef = useRef(null);
   const [inputValue, setInputValue] = useState('');
@@ -212,29 +213,62 @@ export default function VideoPlayer({
   // YouTube/Vimeo don't reject play() when the browser blocks autoplay, and a
   // native player can resolve without starting, so probe the player state
   // shortly after a sync to surface the same "Click to start" fallback.
+  //
+  // The probe must not leave the button on screen: a viewer without control
+  // cannot start anything, and a player that starts late would keep the
+  // button up. The state is polled until the player actually runs, and the
+  // button is only ever shown to someone who can act on it.
   useEffect(() => {
-    if (!url || !playing) return undefined;
+    if (!url || !playing || !canControl) return undefined;
     const player = getPlayer();
     const isYouTube = typeof player?.getPlayerState === 'function' && typeof player?.playVideo === 'function';
     const isVimeo = !isYouTube && typeof player?.getPaused === 'function';
     const isHtml5 = !isYouTube && !isVimeo && typeof player?.play === 'function';
     if (!isYouTube && !isVimeo && !isHtml5) return undefined;
-    const timer = window.setTimeout(() => {
+
+    const clearIfRunning = () => {
+      setAutoplayBlocked(false);
+      window.clearInterval(timer);
+    };
+
+    let checks = 0;
+    const timer = window.setInterval(() => {
+      checks += 1;
       try {
         if (isYouTube) {
           const state = player.getPlayerState();
-          if (state !== 1 && state !== 3) setAutoplayBlocked(true);
+          // 1 = playing, 3 = buffering.
+          if (state === 1 || state === 3) {
+            clearIfRunning();
+            return;
+          }
         } else if (isVimeo) {
           Promise.resolve(player.getPaused()).then((paused) => {
-            if (paused) setAutoplayBlocked(true);
+            if (!paused) clearIfRunning();
           }).catch(() => {});
-        } else if (player.paused) {
-          setAutoplayBlocked(true);
+        } else if (player && !player.paused) {
+          clearIfRunning();
+          return;
         }
       } catch { /* ignore */ }
-    }, 1500);
-    return () => window.clearTimeout(timer);
-  }, [getPlayer, url, playing, syncNonce]);
+      // After a second and a half the player is not running, so offer the
+      // manual start. The offer stays until the player actually runs, so a
+      // failed manual start can be retried and the button never lingers
+      // over a video that is playing on its own.
+      if (checks >= 6) setAutoplayBlocked(true);
+    }, 500);
+    return () => window.clearInterval(timer);
+  }, [getPlayer, url, playing, syncNonce, canControl]);
+
+  // The fallback is only meaningful while the room wants playback. Once the
+  // room is paused the button would linger over a video nobody is watching.
+  useEffect(() => {
+    if (!playing) setAutoplayBlocked(false);
+  }, [playing]);
+
+  // A viewer without control can never start the video themselves, so the
+  // button is hidden for them.
+  const showAutoplayBlocked = autoplayBlocked && canControl && playing;
 
   const reassertRoomState = useCallback(() => {
     syncPlayback();
@@ -261,13 +295,43 @@ export default function VideoPlayer({
 
   const submit = (event) => {
     event.preventDefault();
-    const normalized = normalizeVideoUrl(inputValue);
+    const trimmed = inputValue.trim();
+    // No link entered: act as "Play next" - advance to the next queued item.
+    if (!trimmed) {
+      if (hasQueueItems && (url || streamId) && typeof onPlayNext === 'function') onPlayNext();
+      return;
+    }
+    const normalized = normalizeVideoUrl(trimmed);
     if (!normalized) {
-      setLocalError('Enter an HTTP or HTTPS video URL. Use the Drive picker for Google Drive files.');
+      setLocalError('Enter a valid video URL. ');
       return;
     }
     setLocalError('');
+    const needsConversion = isConversionRequired(normalized);
+    // Guests cannot queue conversion-requiring links (no account to run the job).
+    if (needsConversion && !canConvert) {
+      setLocalError('Sign in to convert and queue this platform.');
+      return;
+    }
+    // When a video is already playing with more than a few seconds left, queue
+    // the new link instead of replacing the current playback. Otherwise (no
+    // video, ended, or near the end) load it directly.
+    const hasCurrent = Boolean(url || streamId);
+    const nearEnd = Boolean(duration && duration > 0 && (duration - (roomTime || 0)) <= 5);
+    const shouldQueue = hasCurrent && playing && !nearEnd && typeof onQueueAdd === 'function';
+    if (shouldQueue) {
+      onQueueAdd(normalized);
+      setInputValue('');
+      return;
+    }
+    if (isConversionRequired(normalized)) {
+      // Link-only platform: hand the URL to the Convert tab instead of
+      // trying to play it directly. The room keeps playing.
+      onConvert?.({ url: normalized });
+      return;
+    }
     onLoadVideo?.(normalized);
+    setInputValue('');
   };
   const handleUnmute = useCallback(() => {
     setActivated(true);
@@ -329,8 +393,11 @@ export default function VideoPlayer({
                 }}
                 onPause={() => {
                   playingRef.current = false;
-                  // The engine stopped the player itself.
-                  if (consumeProgrammaticEvent('pause')) return;
+                  // The room already believes the video is paused, so this is
+                  // the room's own change coming back, not a user action. The
+                  // room state is the authority here: a pause is only ever
+                  // requested programmatically when the room wanted it paused.
+                  if (!playing) return;
                   // A viewer without control stays on the room's play state.
                   if (!canControl) {
                     reassertRoomState();
@@ -338,7 +405,7 @@ export default function VideoPlayer({
                   }
                   onPlayPause?.(false);
                 }}
-                onEnded={() => onPlayPause?.(false)}
+                onEnded={() => (onEnded ? onEnded() : onPlayPause?.(false))}
                 onTimeUpdate={(event) => onProgress?.(event.currentTarget.currentTime)}
                 onDurationChange={(event) => onDuration?.(event.currentTarget.duration)}
                 onSeeked={(event) => {
@@ -374,11 +441,11 @@ export default function VideoPlayer({
                 playingRef.current = true;
                 // Restore audio once the page has a user gesture.
                 if (activated) setPlayerMuted(false);
+                // The room already believes the video is playing, so this is
+                // the room's own change coming back, not a user action.
+                if (playing) return;
                 // The engine started the player itself.
                 if (consumeProgrammaticEvent('play')) return;
-                // The room already believes the video is playing, so there
-                // is nothing to change.
-                if (playing) return;
                 // A viewer without control must follow the host's play state.
                 if (!canControl) {
                   markProgrammaticPause();
@@ -392,8 +459,11 @@ export default function VideoPlayer({
               }}
               onPause={() => {
                 playingRef.current = false;
-                // The engine stopped the player itself.
-                if (consumeProgrammaticEvent('pause')) return;
+                // The room already believes the video is paused, so this is
+                // the room's own change coming back, not a user action. The
+                // room state is the authority here: a pause is only ever
+                // requested programmatically when the room wanted it paused.
+                if (!playing) return;
                 // A viewer without control stays on the room's play state.
                 if (!canControl) {
                   reassertRoomState();
@@ -401,7 +471,7 @@ export default function VideoPlayer({
                 }
                 onPlayPause?.(false);
               }}
-              onEnded={() => onPlayPause?.(false)}
+              onEnded={() => (onEnded ? onEnded() : onPlayPause?.(false))}
               onProgress={(state) => onProgress?.(Number(state.playedSeconds || 0))}
               onDuration={(seconds) => onDuration?.(Number(seconds || 0))}
               onSeek={(seconds) => {
@@ -431,11 +501,11 @@ export default function VideoPlayer({
             </div>
           )}
           </div>
-          {autoplayBlocked ? (
+          {showAutoplayBlocked ? (
             <button
               type="button"
               className="absolute inset-0 z-10 m-auto flex h-12 w-fit items-center justify-center rounded-md bg-black/75 px-5 text-sm font-medium text-white"
-              onClick={syncPlayback}
+              onClick={() => { setAutoplayBlocked(false); syncPlayback(); }}
             >
               Click to start playback
             </button>
@@ -482,7 +552,29 @@ export default function VideoPlayer({
             disabled={!canControl}
           />
         </div>
-        <Button type="submit" variant="secondary" disabled={!canControl || !inputValue.trim()}>Load video</Button>
+        {normalizeVideoUrl(inputValue.trim()) ? (
+          <span className={cn(
+            'hidden items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium sm:inline-flex',
+            isConversionRequired(inputValue.trim())
+              ? 'border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-300'
+              : 'border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900/50 dark:bg-emerald-950/30 dark:text-emerald-300',
+          )}>
+            {matchPlatform(inputValue.trim())
+              ? `${platformLabel(inputValue.trim())} · ${isEmbeddable(inputValue.trim()) ? 'Plays directly' : 'Needs conversion'}`
+              : 'Direct video link'}
+          </span>
+        ) : null}
+        <Button
+          type="submit"
+          variant="secondary"
+          disabled={!canControl || (!inputValue.trim() && !hasQueueItems)}
+        >
+          {inputValue.trim()
+            ? (url || streamId
+                ? (playing && !(duration && duration > 0 && (duration - (roomTime || 0)) <= 5) ? 'Add to queue' : 'Play')
+                : 'Play')
+            : (hasQueueItems ? 'Play next' : 'Play')}
+        </Button>
         {canConvert ? (
           <Button
             type="button"
