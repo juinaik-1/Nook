@@ -469,6 +469,10 @@ export default function Room() {
           <div className="flex min-w-0 flex-col gap-4">
             <div className="sticky top-0 z-20 -mx-4 bg-zinc-50 px-4 py-2 dark:bg-zinc-950 sm:-mx-6 sm:px-6 lg:static lg:mx-0 lg:bg-transparent lg:p-0">
               <VideoPlayer
+                mediaItem={queue.items.find((item) =>
+                  (video.streamId && item.streamId === video.streamId) ||
+                  (video.url && item.url === video.url),
+                )}
                 url={video.url}
               streamId={video.streamId}
               streamName={video.streamName}
