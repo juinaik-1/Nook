@@ -164,7 +164,14 @@ export const config = Object.freeze({
   dataDir: resolveDirectory(process.env.DATA_DIR, path.join(serverDir, 'data')),
   downloadDir: resolveDirectory(process.env.DOWNLOAD_DIR, path.join(serverDir, 'downloads')),
   maxSourceBytes: Number(process.env.MAX_SOURCE_GB || 5) * 1024 ** 3,
+  perUserQuotaBytes: Number(process.env.PER_USER_QUOTA_GB || 10) * 1024 ** 3,
   maxQueueSize: Number(process.env.MAX_QUEUE_SIZE || 3),
+  maxConversionsPerUserPerHour: Number(process.env.MAX_CONVERSIONS_PER_USER_HOUR || 5),
+  supabaseUrl: process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || '',
+  supabaseAnonKey: process.env.SUPABASE_ANON_KEY
+    || process.env.SUPABASE_KEY
+    || process.env.VITE_SUPABASE_ANON_KEY
+    || '',
   fileTtlMs: fileTtlHours * 60 * 60 * 1000,
   ffmpegThreads: parseFfmpegThreads(process.env.FFMPEG_THREADS),
   // Free space the disk must have left before a conversion is accepted.
@@ -178,6 +185,7 @@ export const config = Object.freeze({
     auth: parseRateLimit(process.env.AUTH_RATE_LIMIT_PER_MIN, 20),
     drive: parseRateLimit(process.env.DRIVE_RATE_LIMIT_PER_MIN, 30),
     jobs: parseRateLimit(process.env.JOBS_RATE_LIMIT_PER_MIN, 20),
+    queue: parseRateLimit(process.env.QUEUE_RATE_LIMIT_PER_MIN, 600),
     // The media route streams bytes, not API calls, so it gets its own and
     // much larger budget.
     media: parseRateLimit(process.env.MEDIA_RATE_LIMIT_PER_MIN, 600),
@@ -185,9 +193,11 @@ export const config = Object.freeze({
 });
 
 if (!Number.isFinite(config.maxSourceBytes) || config.maxSourceBytes <= 0
+    || !Number.isFinite(config.perUserQuotaBytes) || config.perUserQuotaBytes <= 0
     || !Number.isInteger(config.maxQueueSize) || config.maxQueueSize < 1
+    || !Number.isInteger(config.maxConversionsPerUserPerHour) || config.maxConversionsPerUserPerHour < 1
     || !Number.isFinite(config.fileTtlMs) || config.fileTtlMs < 60_000) {
-  throw new Error('MAX_SOURCE_GB, MAX_QUEUE_SIZE, or FILE_TTL_HOURS has an invalid value.');
+  throw new Error('MAX_SOURCE_GB, PER_USER_QUOTA_GB, MAX_QUEUE_SIZE, or FILE_TTL_HOURS has an invalid value.');
 }
 
 export function ensureDataDirectories() {

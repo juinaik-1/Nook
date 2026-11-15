@@ -1,22 +1,36 @@
+
 # Nook Watch Party
-
-Nook is a React/Vite watch-party app with Supabase rooms, synchronized playback, chat, voice, Google sign-in, private Drive streaming, and an authorized video-conversion queue.
-
-## Local setup
-
-1. Install frontend packages: `npm install`.
-2. Copy `.env.example` to `.env` and set the Supabase, Google frontend, and optional TURN values.
-3. Install backend packages: `npm install --prefix server`.
-4. Copy `server/.env.example` to `server/.env`. Configure Google OAuth, the allowlist, and three independently generated secrets as described below.
-5. Install `ffmpeg`, `ffprobe`, and `yt-dlp` on the backend host and make sure they are on `PATH`.
-6. Start both apps with `npm run dev`. The Vite app runs at `http://localhost:5173`, and the API runs at `http://localhost:3001`.
-
-The backend refuses to start when required secrets or configuration are missing or weak. `FRONTEND_ORIGINS` is an exact comma-separated origin list; no wildcard or Vercel-domain rule is used. `.env`, `server/.env`, `DATA_DIR`, and `DOWNLOAD_DIR` must not be committed.
-
-## Environment
-
-Frontend values go in the repository `.env`:
-
+ 
+React/Vite watch-party app with Supabase rooms, synced playback, chat, voice, Google sign-in, private Google Drive streaming, and a video-conversion queue.
+ 
+- **Frontend:** React + Vite (static, deployed on Vercel)
+- **Backend:** Node API in `server/` (deployed on a Linux VM)
+- **Realtime/data:** Supabase
+## Quick start
+ 
+Requires Node.js, `ffmpeg`, `ffprobe`, and `yt-dlp` (on `PATH`).
+ 
+```bash
+# Frontend
+npm install
+cp .env.example .env
+ 
+# Backend
+npm install --prefix server
+cp server/.env.example server/.env
+ 
+# Run both
+npm run dev
+```
+ 
+- App: http://localhost:5173
+- API: http://localhost:3001
+Fill in `.env` and `server/.env` (see [Configuration](#configuration)). The API refuses to start if required secrets are missing or weak. Never commit `.env`, `server/.env`, `DATA_DIR`, or `DOWNLOAD_DIR`.
+ 
+## Configuration
+ 
+### Frontend (`.env`)
+ 
 ```env
 VITE_API_URL=http://localhost:3001
 VITE_GOOGLE_CLIENT_ID=your-oauth-client-id.apps.googleusercontent.com
@@ -24,155 +38,202 @@ VITE_GOOGLE_API_KEY=your-restricted-picker-api-key
 VITE_GOOGLE_APP_ID=your-google-cloud-project-number
 VITE_SUPABASE_URL=https://your-project.supabase.co
 VITE_SUPABASE_ANON_KEY=your-supabase-anon-key
-VITE_TURN_URL=turn:relay.metered.ca:80
-VITE_TURN_USERNAME=your-turn-username
-VITE_TURN_CREDENTIAL=your-turn-credential
+VITE_TURN_URL=turn:relay.metered.ca:80          # optional
+VITE_TURN_USERNAME=your-turn-username           # optional
+VITE_TURN_CREDENTIAL=your-turn-credential       # optional
 ```
-
-Server values go in `server/.env`; see [server/.env.example](./server/.env.example). Set `PUBLIC_BASE_URL` to the public API origin in production. It is the origin used to construct signed stream URLs, not a localhost URL. Set `FRONTEND_ORIGINS` to the exact production frontend origin(s). `DATA_DIR` holds encrypted refresh tokens and stream records. `DOWNLOAD_DIR` holds conversion input/output files.
-
-`MAX_SOURCE_GB` limits URL and Drive conversion downloads. `MAX_QUEUE_SIZE` counts only queued and active jobs; one conversion runs at a time. Drive streams expire after 12 hours. Converted-file streams expire after `FILE_TTL_HOURS`. The cleanup task runs every ten minutes.
-
-The Convert page accepts a video picked from My Drive or a URL supported by `yt-dlp`. Drive files are identified by their actual media contents, not only their filename or MIME type, so formats such as MKV and AVI can be analyzed and converted when ffmpeg supports their codecs. Google-native documents and folders are not media inputs.
-
-Generate three independent values (run the command once per variable; do not reuse them):
-
-```powershell
+ 
+### Backend (`server/.env`)
+ 
+See [server/.env.example](./server/.env.example) for the full list.
+ 
+| Variable | Notes |
+|---|---|
+| `PUBLIC_BASE_URL` | Public API origin (used for signed stream URLs). Required in production; must not be localhost. |
+| `FRONTEND_ORIGINS` | Exact, comma-separated frontend origins. No wildcards. |
+| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Same client ID as `VITE_GOOGLE_CLIENT_ID`. Keep the secret server-side only. |
+| `GOOGLE_REDIRECT_URI` | Must exactly match the authorized redirect URI in Google Cloud. |
+| `ALLOWED_EMAILS` | Optional. Exact lowercase emails, comma-separated. Unset = rely on Google consent screen only. |
+| `SESSION_SECRET`, `STREAM_SECRET`, `TOKEN_ENCRYPTION_KEY` | Three independent secrets (see below). |
+| `SUPABASE_URL` / `SUPABASE_ANON_KEY` | Required for the room playback queue. Service-role key not needed. |
+| `DATA_DIR` | Encrypted refresh tokens and stream records. |
+| `DOWNLOAD_DIR` | Conversion input/output files. |
+| `MAX_SOURCE_GB` | Max download size for URL/Drive conversions. |
+| `MAX_QUEUE_SIZE` | Max queued + active jobs. One conversion runs at a time. |
+| `FILE_TTL_HOURS` | Converted-file lifetime (default `36`). Also drives cleanup. |
+| `MIN_FREE_DISK_GB` | Pause new jobs below this free space (default `1`). |
+| `FFMPEG_THREADS` | ffmpeg thread cap (default `2`, range `1`–`8`). |
+ 
+### Generate secrets
+ 
+Run once per variable; don't reuse values.
+ 
+```bash
+# SESSION_SECRET and STREAM_SECRET
 node -e "console.log(require('node:crypto').randomBytes(32).toString('base64url'))"
-```
-
-Use the first two outputs for `SESSION_SECRET` and `STREAM_SECRET`. For `TOKEN_ENCRYPTION_KEY`, use a fresh 32-byte output encoded as base64:
-
-```powershell
+ 
+# TOKEN_ENCRYPTION_KEY (32 bytes, base64)
 node -e "console.log(require('node:crypto').randomBytes(32).toString('base64'))"
 ```
-
-Never put server secrets in Vercel or any `VITE_*` variable. The browser receives a 12-hour application JWT and short-lived stream URLs only; Google refresh tokens stay encrypted in `DATA_DIR`.
-
-## Google Cloud configuration
-
-1. **Create/select a Cloud project.** Enable **Google Drive API** and **Google Picker API** in APIs & Services → Library.
-2. **Configure OAuth consent and branding.** In Google Auth Platform → Branding, set the app name, logo, support email, authorized domain, homepage, and Privacy policy URL to `https://YOUR-FRONTEND-DOMAIN/privacy`. Nook provides the policy at `/privacy`; deploy it on your verified HTTPS domain before entering the URL. Google owns the consent-screen layout and disclosures; Nook cannot replace or restyle Google's account/permission screen. In Audience, choose the intended audience; while in Testing, add each allowed Google account as a test user. In Data Access, add the `https://www.googleapis.com/auth/drive.readonly` scope. This read-only scope lets Nook retrieve Drive files you pick; it cannot edit or delete them. Google classifies it as restricted. Public production apps may need Google verification and a security assessment before users outside the test-user list can authorize it.
-3. **Create a Web application OAuth client.** Under Authorized JavaScript origins, add each exact browser origin, such as `http://localhost:5173` and `https://your-Nook-domain.example`. Under Authorized redirect URIs, add the API callback, such as `http://localhost:3001/api/auth/google/callback` and `https://api.your-Nook-domain.example/api/auth/google/callback`. Put its client ID in both `GOOGLE_CLIENT_ID` and `VITE_GOOGLE_CLIENT_ID`; keep the client secret only in `server/.env`.
-4. **Create a restricted API key for Picker.** Restrict its application to HTTP referrers and list only the exact frontend origins. Under API restrictions, restrict it to **Google Picker API**. Put this public, referrer-restricted key in `VITE_GOOGLE_API_KEY`.
-5. **Set the Picker App ID.** Copy the Cloud project number (not the project name or OAuth client ID) to `VITE_GOOGLE_APP_ID`. This is required for shared-drive Picker support.
-6. **Configure the allowlist (optional).** The Google OAuth consent screen is the gate: while the app is in "Testing" only the accounts added as test users can sign in. If you also want Nook to lock the app down to a fixed set of accounts, put the exact lowercase emails in the server `ALLOWED_EMAILS`, comma-separated. Leave `ALLOWED_EMAILS` unset to rely on Google alone.
-7. **Set the server callback.** `GOOGLE_REDIRECT_URI` must exactly match the authorized redirect URI. Drive authorization uses one-time state and PKCE, with the `drive.readonly` scope and offline access. After changing from the previous `drive.file` permission, each user must click **Reconnect Drive** and approve the new read-only permission. Existing refresh tokens do not gain broader access automatically. The Picker shows videos and files owned by the signed-in user in My Drive; it excludes items shared with the user and Shared drives.
-
-Google Identity Services signs users in; the server verifies the ID token, verified email, audience, and allowlist before issuing an application session.
-
-Guests can join an existing room by invite link or room code without signing in. Guest access is limited to watching, chat, and voice; guests cannot create rooms, load or control media, connect Drive, or convert videos. Google sign-out clears the local Nook session; it does not revoke the separate Drive authorization. Users can revoke that authorization in Google Account settings.
-
-## Backend VM
-
-Use a maintained Linux VM with enough disk space for both the downloaded source and converted output. Install and keep the media tools updated:
-
+ 
+Never put server secrets in Vercel or any `VITE_*` variable.
+ 
+## Google Cloud setup
+ 
+1. **Project:** Create/select a project. Enable **Google Drive API** and **Google Picker API** (APIs & Services → Library).
+2. **Branding & consent** (Google Auth Platform):
+   - Branding: set app name, logo, support email, authorized domain, homepage, and Privacy policy URL `https://YOUR-FRONTEND-DOMAIN/privacy` (Nook serves this page; deploy it first).
+   - Audience: while in *Testing*, add each allowed account as a test user.
+   - Data Access: add scope `https://www.googleapis.com/auth/drive.readonly` (read-only; classified as *restricted* — public production use may require Google verification and a security assessment).
+3. **OAuth client (Web application):**
+   - Authorized JavaScript origins: `http://localhost:5173`, `https://your-nook-domain.example`
+   - Authorized redirect URIs: `http://localhost:3001/api/auth/google/callback`, `https://api.your-nook-domain.example/api/auth/google/callback`
+4. **Picker API key:** Restrict to HTTP referrers (exact frontend origins) and to **Google Picker API** only. Set as `VITE_GOOGLE_API_KEY`.
+5. **Picker App ID:** Set `VITE_GOOGLE_APP_ID` to the Cloud **project number** (not the project name or client ID).
+6. **Server callback:** `GOOGLE_REDIRECT_URI` must match the redirect URI above.
+Notes:
+- Users upgrading from the old `drive.file` scope must click **Reconnect Drive** and approve the read-only permission.
+- The Picker shows only videos owned by the signed-in user in My Drive (no shared items or Shared drives).
+- Sign-out clears the Nook session only. Users revoke Drive access in their Google Account settings.
+## Supabase
+ 
+Frontend uses Supabase Realtime for presence, chat, and playback broadcasts. Set up the `messages` table and its read/write policies in the SQL editor.
+ 
+The API stores the room playback queue in `room_queues`. Create it once in the SQL editor:
+ 
+```sql
+create table room_queues (
+  room_id text primary key,
+  queue_items jsonb,
+  version integer,
+  updated_at timestamptz
+);
+```
+ 
+Also add a permissive RLS policy (queue is public room state; the API is the only writer) and a `pg_cron` job named `cleanup-stale-queues` that deletes rows with `updated_at` older than 36 hours. Without the table the API still starts, but queue endpoints report an error.
+ 
+## Deployment
+ 
+### Frontend (Vercel)
+ 
+Set in the Vercel project (Production and any exact Preview origins):
+ 
+```
+VITE_API_URL=https://api.your-domain.example
+VITE_GOOGLE_CLIENT_ID=...
+VITE_GOOGLE_API_KEY=...
+VITE_GOOGLE_APP_ID=...
+VITE_SUPABASE_URL=...
+VITE_SUPABASE_ANON_KEY=...
+VITE_TURN_*   # optional
+```
+ 
+`vercel.json` rewrites all paths to `index.html`. Redeploy after changing any `VITE_*` value.
+ 
+Add the deployed frontend origin to: the OAuth client's JavaScript origins, the Picker key's referrer list, and server `FRONTEND_ORIGINS`. No wildcard `.vercel.app` rules.
+ 
+### Backend (Linux VM)
+ 
+Use a VM with enough disk for the source download and converted output together.
+ 
 ```bash
 sudo apt-get update
 sudo apt-get install -y ffmpeg python3-pip pipx
 pipx ensurepath
 pipx install yt-dlp
-pipx upgrade yt-dlp
-ffmpeg -version
-ffprobe -version
-yt-dlp --version
+ffmpeg -version && ffprobe -version && yt-dlp --version
 ```
-
-Run the API as a dedicated service account. Keep `DATA_DIR` and `DOWNLOAD_DIR` on a private, persistent filesystem with adequate free space; grant write access only to that account. Set `NODE_ENV=production`, `PUBLIC_BASE_URL=https://api.your-domain.example`, exact `FRONTEND_ORIGINS`, Google credentials, and strong generated secrets. Restart the service after updating `yt-dlp`, `ffmpeg`, or environment values. Conversion accepts only content you own or may legally share.
-
-### Keeping conversions off the API's CPU
-The API proxies video streams while a conversion runs in the same process, so ffmpeg is never allowed to take every core. Two limits are applied automatically:
-
-- **Thread caps.** ffmpeg and ffprobe run with `-threads`, `-threads:v`, `-threads:a` and `-filter_threads` limits. `FFMPEG_THREADS` (default `2`, allowed range `1`–`8`) sets the value. Raise it on a machine that is dedicated to conversions; lower it on a small VM.
-- **Low scheduler priority.** On Linux the media tools are started through `nice -n 15`, so the kernel gives the API the CPU first and leaves the leftovers to the conversion. The tool runs in its own process group, so cancelling a job still stops the real ffmpeg. `nice` is part of coreutils; when it is unavailable the tool runs at normal priority.
-
-Give the API service account a slightly higher CPU weight than the conversion if the machine is shared, and keep at least one core free for the stream proxy.
-
-### Disk space and cleanup
-
-A conversion needs room for the downloaded source and the output at the same time, so the API refuses new work before it fills the disk:
-
-- **Free space guard.** `POST /api/jobs` checks the free space on the `DOWNLOAD_DIR` filesystem with `fs.statfs` and refuses the job when less than `MIN_FREE_DISK_GB` (default `1`) is left. The user is told that conversions are paused, not that the request failed. This is a tripwire, not a reservation: the per job check still insists on room for the source and the output together.
-- **Leftover files.** A conversion that is cancelled, or a server that stops mid job, leaves its source and partial output behind. Those files are removed as soon as the job ends, and anything still there afterwards is removed by a sweep that runs on startup and once an hour. A file that a live stream still serves is never removed.
-- **One lifetime.** `FILE_TTL_HOURS` (default `36`) decides when a converted video is deleted and when it disappears from the room's list — the countdown in the "Your recent conversions" panel shows the same time. The cleanup sweep follows the same number, so there is a single place to change it.
-
-Give `DOWNLOAD_DIR` its own filesystem with a quota, so a runaway download cannot take the API's disk with it. Watch the free space and the `Disk cleanup removed ...` log line.
-
-### Rate limits
-
-Every limit is per client address per minute, and every one can be set in `server/.env`:
-
-| Setting | Default | What it covers |
-|---|---|---|
-| `API_RATE_LIMIT_PER_MIN` | 120 | everything under `/api` |
-| `AUTH_RATE_LIMIT_PER_MIN` | 20 | `/api/auth`, so signing in and the session check |
-| `DRIVE_RATE_LIMIT_PER_MIN` | 30 | `/api/drive`, so the Picker token and Drive calls |
-| `JOBS_RATE_LIMIT_PER_MIN` | 20 | starting and converting jobs |
-| `MEDIA_RATE_LIMIT_PER_MIN` | 600 | `/api/stream`, the media route |
-
-The media route is **excluded** from the API limit: it streams bytes rather than API calls, and counting its range requests used to let one viewer exhaust the budget and rate limit the session check. It has its own, much larger budget instead.
-
-Raise `AUTH_RATE_LIMIT_PER_MIN` when many people share one address (an office behind one NAT), otherwise their sign-ins rate limit each other.
-
-### Deploying
-
-The frontend is static and goes to Vercel; the API is a Node service on a VM. Before the first deploy:
-
-- **Frontend** (`Vercel`): set `VITE_API_URL=https://api.your-domain.example` (the documented name; `VITE_CONVERT_API_URL` is only a local alias), plus the Google and Supabase values. `vercel.json` already rewrites every path to `index.html`, so the room routes work on a refresh.
-- **Backend** (`server/.env`): set `NODE_ENV=production`, `PUBLIC_BASE_URL=https://api.your-domain.example`, `FRONTEND_ORIGINS=https://your-app.vercel.app` (exact origin, no wildcards), and `GOOGLE_REDIRECT_URI=https://api.your-domain.example/api/auth/google/callback` — which must also be added to the Google Cloud console's authorized redirect URIs.
-- **Disk**: `DATA_DIR` and `DOWNLOAD_DIR` must be on a persistent, private filesystem. `DATA_DIR` holds the encrypted Drive tokens and the stream registry; `DOWNLOAD_DIR` holds the converted files. Neither may be an ephemeral container filesystem, or the registry and every conversion are lost on a restart.
-- **One instance.** The stream registry and the job store are files on that machine. With more than one API instance behind a load balancer, a stream created on one is unknown to the other.
-- **Firewall**: allow inbound TCP on the API port from the internet, and nothing else. The API refuses to start in production without `PUBLIC_BASE_URL`, and refuses a `PUBLIC_BASE_URL` that points at localhost.
-
-### Caddy stream proxy
-
-Point the API domain at the VM. Caddy streams reverse-proxy responses; set a negative `flush_interval` on the stream route to disable response buffering and flush immediately:
-
+ 
+Production `server/.env`:
+ 
+```env
+NODE_ENV=production
+PUBLIC_BASE_URL=https://api.your-domain.example
+FRONTEND_ORIGINS=https://your-app.vercel.app
+GOOGLE_REDIRECT_URI=https://api.your-domain.example/api/auth/google/callback
+```
+ 
+Requirements:
+- Run the API as a dedicated service account with write access only to `DATA_DIR` and `DOWNLOAD_DIR`.
+- Both directories must be on a persistent, private filesystem (not ephemeral containers). Give `DOWNLOAD_DIR` its own filesystem/quota.
+- Run a **single** API instance. The stream registry and job store are local files.
+- Firewall: allow inbound TCP on the API port only.
+- Restart the service after updating `yt-dlp`, `ffmpeg`, or env values. Update `yt-dlp` with `pipx upgrade yt-dlp`.
+**Update and restart (PM2):**
+ 
+```bash
+cd ~/RAVE2.0/server && git pull origin main && npm install && pm2 restart nook-api
+```
+ 
+If you edited `.env`, recreate the process so it re-reads the file:
+ 
+```bash
+pm2 delete nook-api && pm2 start server.js --name nook-api && pm2 save
+```
+ 
+### Caddy (stream proxy)
+ 
+Disable response buffering on the stream route and preserve `Range`/`Content-Range` headers so seeking works.
+ 
 ```caddyfile
 api.your-domain.example {
-	@videoStream path /api/stream/*
-	handle @videoStream {
-		reverse_proxy 127.0.0.1:3001 {
-			flush_interval -1
-		}
-	}
-
-	handle {
-		reverse_proxy 127.0.0.1:3001
-	}
+    @videoStream path /api/stream/*
+    handle @videoStream {
+        reverse_proxy 127.0.0.1:3001 {
+            flush_interval -1
+        }
+    }
+ 
+    handle {
+        reverse_proxy 127.0.0.1:3001
+    }
 }
 ```
-
-Do not add a response-buffering layer in front of `/api/stream/*`. Preserve `Range` and `Content-Range` headers for seeking.
-
-## Vercel frontend
-
-Set these project environment variables in Vercel (Production and any exact Preview origins you allow):
-
-- `VITE_API_URL=https://api.your-domain.example`
-- `VITE_GOOGLE_CLIENT_ID=...`
-- `VITE_GOOGLE_API_KEY=...`
-- `VITE_GOOGLE_APP_ID=...`
-- Existing `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`, and optional `VITE_TURN_*` values
-
-Add the deployed Vercel frontend origin to the OAuth client’s JavaScript origins, the Picker key’s HTTP-referrer restrictions, and server `FRONTEND_ORIGINS`. Never use a wildcard `.vercel.app` CORS rule. Rebuild/redeploy the frontend after changing Vite environment variables.
-
-## Supabase
-
-Keep the existing Supabase project URL and anon key in the frontend environment. The app uses Supabase Realtime for room presence, chat, and playback-control broadcasts. Configure the existing `messages` table and its read/write policies for room chat in the Supabase SQL editor; do not put a Supabase service-role key in the browser.
-
+ 
+## Operations
+ 
+### CPU limits for conversions
+ 
+- ffmpeg/ffprobe run with thread caps set by `FFMPEG_THREADS`. Raise on dedicated conversion machines; lower on small VMs.
+- On Linux, media tools run under `nice -n 15` (falls back to normal priority if `nice` is unavailable). Cancelling a job kills the real ffmpeg process.
+- On shared machines, keep at least one core free for the stream proxy.
+### Disk and cleanup
+ 
+- `POST /api/jobs` refuses new work when free space on `DOWNLOAD_DIR` is below `MIN_FREE_DISK_GB`. Per-job checks still require room for source + output.
+- Files from cancelled/crashed jobs are removed when the job ends; a sweep runs on startup and hourly. Files in active streams are never removed.
+- Converted videos are deleted after `FILE_TTL_HOURS`. Drive streams expire after 12 hours. Cleanup task runs every 10 minutes.
+- Watch free space and the `Disk cleanup removed ...` log line.
+### Rate limits
+ 
+Per client address, per minute. All configurable in `server/.env`.
+ 
+| Variable | Default | Covers |
+|---|---|---|
+| `API_RATE_LIMIT_PER_MIN` | 120 | All of `/api` (except media) |
+| `AUTH_RATE_LIMIT_PER_MIN` | 20 | `/api/auth` (sign-in, session check) |
+| `DRIVE_RATE_LIMIT_PER_MIN` | 30 | `/api/drive` (Picker token, Drive calls) |
+| `JOBS_RATE_LIMIT_PER_MIN` | 20 | Starting/converting jobs |
+| `MEDIA_RATE_LIMIT_PER_MIN` | 600 | `/api/stream` (media route) |
+ 
+Raise `AUTH_RATE_LIMIT_PER_MIN` if many users share one IP (e.g. office NAT).
+ 
+## Usage notes
+ 
+- **Guests** can join by invite link or room code without signing in. They can watch, chat, and use voice only — no creating rooms, loading/controlling media, connecting Drive, or converting.
+- **Convert page** accepts a My Drive video or any URL supported by `yt-dlp`. Drive files are detected by actual media content, so MKV/AVI work if ffmpeg supports the codecs. Google-native docs and folders aren't valid inputs.
+- Convert only content you own or may legally share.
+- The browser receives a 12-hour app JWT and short-lived stream URLs only. Google refresh tokens stay encrypted in `DATA_DIR`.
 ## Validation checklist
-
-- [ ] An allowlisted, verified Google email can sign in; a non-allowlisted email is rejected.
-- [ ] Connect Drive, pick a video, share it, and play it on a second signed-in account in the same room.
-- [ ] Seek in a Drive stream and confirm the media request returns `206 Partial Content`.
-- [ ] Change or expire a signed stream URL and confirm the API returns `401`.
-- [ ] An HEVC/MKV Drive video is reported as unplayable and offers **Convert**.
-- [ ] Convert the video, confirm the output plays in a browser, then share it to a room.
-- [ ] Cancel during download and during ffmpeg conversion; confirm the child process stops and temporary files are removed.
-- [ ] Complete four jobs sequentially and confirm completed jobs do not fill the queue.
-- [ ] Convert a 700 MB source with enough disk space and confirm the result completes.
-
-
-## GitDiagram 
+ 
+- [ ] Allowlisted, verified Google email can sign in; non-allowlisted email is rejected.
+- [ ] Connect Drive, pick a video, share it, play it on a second signed-in account in the same room.
+- [ ] Seeking in a Drive stream returns `206 Partial Content`.
+- [ ] Tampered or expired signed stream URL returns `401`.
+- [ ] HEVC/MKV Drive video is reported unplayable and offers **Convert**.
+- [ ] Converted output plays in a browser and can be shared to a room.
+- [ ] Cancelling during download and during ffmpeg stops the child process and removes temp files.
+- [ ] Four sequential jobs complete without filling the queue.
+- [ ] A 700 MB source converts successfully with enough disk space.
+## Architecture
+ 
 [![Architecture diagram](https://gitdiagram.com/diagram-badge.svg)](https://gitdiagram.com/juinaik-1/rave2.0?utm_source=readme&utm_medium=badge)

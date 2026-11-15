@@ -106,19 +106,21 @@ export function getConvertRequestId(roomId) {
 }
 
 // Open the conversion page in a separate tab so the room keeps running.
-export function openConvertTab({ roomId, requestId, streamId, name }) {
+export function openConvertTab({ roomId, requestId, streamId, name, url, auto }) {
   const params = new URLSearchParams();
   if (roomId) params.set('room', roomId);
   if (requestId) params.set('request', requestId);
   if (streamId) params.set('stream', streamId);
   if (name) params.set('name', name);
-  const url = `/convert?${params.toString()}`;
+  if (url) params.set('url', url);
+  if (auto) params.set('auto', '1');
+  const target = `/convert?${params.toString()}`;
   // The tab keeps a reference to the room tab so the finished video can be
   // handed back and the room tab can be focused again.
-  const opened = window.open(url, '_blank');
+  const opened = window.open(target, '_blank');
   if (!opened) {
     // Popup blocked: fall back to the current tab.
-    window.location.assign(url);
+    window.location.assign(target);
   }
   return opened;
 }

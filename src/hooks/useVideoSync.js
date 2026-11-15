@@ -97,6 +97,7 @@ export function useVideoSync({
       // Start paused: the room's video loads in a known state and whoever has
       // control presses play to start it for everyone.
       setPlaying(false);
+      currentRef.current = { streamId: nextStreamId, streamName: name || access.name || 'Video', videoUrl: access.url, time: 0, playing: false };
       return true;
     } catch (requestError) {
       if (requestId === streamRequestRef.current) {
@@ -123,6 +124,7 @@ export function useVideoSync({
     setPlaying(false);
     setLoading(false);
     setError('');
+    currentRef.current = { streamId: '', streamName: '', videoUrl: normalized, time: 0, playing: false };
     return true;
   }, []);
 
@@ -142,6 +144,7 @@ export function useVideoSync({
         name: current.streamName,
         time: current.time,
         playing: current.playing,
+        savedAt: Date.now(),
       }));
     } catch {
       /* the tab storage is a convenience, not a requirement */
@@ -160,13 +163,24 @@ export function useVideoSync({
     }
   }, [roomId, sourceStorageKey]);
 
-  // Remember the source and the position as the video plays.
+  // Remember the source and the position as the video plays. The play state is
+  // part of the dependency list, so a pause is written out immediately: a
+  // refresh within the save interval must not resume a video the room paused.
   useEffect(() => {
     if (!roomId) return undefined;
     saveRoomSource();
     const timer = window.setInterval(saveRoomSource, 5000);
-    return () => window.clearInterval(timer);
-  }, [roomId, saveRoomSource, streamId, videoUrl]);
+    // Write the state one last time as the tab is unloaded, so a refresh
+    // restores exactly what the room was doing at that moment.
+    const onUnload = () => saveRoomSource();
+    window.addEventListener('pagehide', onUnload);
+    window.addEventListener('visibilitychange', onUnload);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener('pagehide', onUnload);
+      window.removeEventListener('visibilitychange', onUnload);
+    };
+  }, [roomId, saveRoomSource, streamId, videoUrl, playing]);
 
   // Restore the source after a refresh. The room is asked for its state
   // first, and the saved copy is only used when the room has none to give,
@@ -190,8 +204,17 @@ export function useVideoSync({
         setRoomTime(Number(saved.time));
       }
       if (typeof saved.playing === 'boolean') {
-        currentRef.current = { ...currentRef.current, playing: saved.playing };
-        setPlaying(saved.playing);
+        // Only a snapshot written in the last minute may resume playback. An
+        // older one, or one from before the snapshot carried a timestamp, must
+        // not start a video the room paused. The source and the position are
+        // still restored; the room state decides the play state.
+        const savedAt = Number(saved.savedAt);
+        const fresh = Number.isFinite(savedAt) && Date.now() - savedAt < 60_000;
+        const nextPlaying = fresh ? saved.playing : false;
+        // Temporary diagnostic: remove once the refresh behaviour is confirmed.
+        console.log('[room] restore', { savedPlaying: saved.playing, savedAt, fresh, nextPlaying, source: saved.videoUrl || saved.streamId });
+        currentRef.current = { ...currentRef.current, playing: nextPlaying };
+        setPlaying(nextPlaying);
       }
       setSyncNonce((value) => value + 1);
     }, 1500);
@@ -433,6 +456,46 @@ export function useVideoSync({
     }
   }, [applyUrl, canControl, channel, roomId]);
 
+  // Force playback on, ignoring the "already playing" short-circuit. Used by
+  // the queue's Play button and auto-advance, where the previous video may
+  // have been playing and currentRef.playing is stale after a source swap.
+  const playNow = useCallback(() => {
+    if (!canControl) return;
+    const current = currentRef.current;
+    currentRef.current = { ...current, playing: true };
+    setPlaying(true);
+    lastBroadcastRef.current = Date.now();
+    broadcastState({ playing: true });
+  }, [broadcastState, canControl]);
+
+  // Play one queue item: load its source, announce it to the room, and start
+  // playback. The queue itself is owned by useQueue, so this only deals with
+  // the media.
+  const playQueueItem = useCallback((item) => {
+    if (!canControl || !item) return;
+    if (item.status === 'failed') return;
+    if (item.kind === 'job' && item.status === 'pending') return;
+    if (item.kind === 'stream' && item.streamId) {
+      void applyStream(item.streamId, item.title || 'Video').then((loaded) => {
+        if (!loaded) return;
+        if (roomId && channel) {
+          sendRef.current('video:load', { roomId, type: 'stream', streamId: item.streamId, name: item.title || 'Video', playing: true });
+        }
+        playNow();
+      });
+      return;
+    }
+    if (item.kind === 'url' && item.url) {
+      const normalized = normalizeVideoUrl(item.url);
+      if (!normalized || !applyUrl(normalized)) return;
+      if (roomId && channel) {
+        sendRef.current('video:load', { type: 'url', url: normalized, playing: true });
+      }
+      // Delay so the player has the new source before play is requested.
+      window.setTimeout(() => playNow(), 150);
+    }
+  }, [canControl, applyStream, applyUrl, channel, roomId, playNow]);
+
   const requestState = useCallback(() => {
     channel?.send({
       type: 'broadcast',
@@ -448,16 +511,22 @@ export function useVideoSync({
 
   const handlePlayPause = useCallback((nextPlaying) => {
     if (!canControl) return;
-    if (applyingRemoteRef.current) return;
     const target = Boolean(nextPlaying);
     const current = currentRef.current;
-    // Ignore echoes from the local player after a remote update was applied.
+    // Ignore a change that matches the room's current state. The echo of a
+    // remote update is filtered in the player, so a pause is never dropped
+    // here: dropping it left the room playing after a refresh.
     if (target === Boolean(current.playing)) return;
     currentRef.current = { ...current, playing: target };
     setPlaying(target);
     lastBroadcastRef.current = Date.now();
     broadcastState({ playing: target });
-  }, [broadcastState, canControl]);
+    // Write the snapshot now, not on the next interval tick. A refresh right
+    // after a pause must not restore a playing video.
+    saveRoomSource();
+    // Temporary diagnostic: remove once the refresh behaviour is confirmed.
+    console.log('[room] playPause', target, 'snapshot playing =', currentRef.current.playing);
+  }, [broadcastState, canControl, saveRoomSource]);
 
   const handleSeek = useCallback((nextTime, options = {}) => {
     if (!canControl || applyingRemoteRef.current) return;
@@ -528,9 +597,11 @@ export function useVideoSync({
     syncNonce,
     loadVideo,
     loadStream,
+    playQueueItem,
     shareConvertedVideo,
     handleReady,
     handlePlayPause,
+    playNow,
     handleSeek,
     handleProgress,
     handleDuration,

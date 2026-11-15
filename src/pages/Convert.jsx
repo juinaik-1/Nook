@@ -4,9 +4,18 @@ import { AlertCircle, ArrowLeft, CheckCircle2, Film, X, XCircle } from 'lucide-r
 import DriveSource from '../components/DriveSource';
 import { Badge, Button, Field, Panel, inputClass } from '../components/ui';
 import { useConversion } from '../hooks/useConversion';
+import { fetchMyStorage, fetchQueue, patchQueueItem } from '../utils/api';
 import { publishConvertedVideo, subscribeConvertedVideoAck, getConvertRequestId } from '../utils/roomBridge';
 
 const PUBLISH_RETRY_MS = 2000;
+
+function formatBytes(bytes) {
+  const value = Number(bytes || 0);
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 ** 2) return `${(value / 1024).toFixed(1)} KB`;
+  if (value < 1024 ** 3) return `${(value / 1024 ** 2).toFixed(1)} MB`;
+  return `${(value / 1024 ** 3).toFixed(2)} GB`;
+}
 const MAX_PUBLISH_ATTEMPTS = 15;
 
 export default function Convert() {
@@ -19,6 +28,8 @@ export default function Convert() {
   const [requestId, setRequestId] = useState(searchParams.get('request') || '');
   const streamParam = searchParams.get('stream') || '';
   const nameParam = searchParams.get('name') || '';
+  const urlParam = searchParams.get('url') || '';
+  const autoParam = searchParams.get('auto') === '1';
   const initialSource = location.state?.streamId
     ? { streamId: location.state.streamId, name: location.state.name || 'Drive video' }
     : streamParam
@@ -26,10 +37,11 @@ export default function Convert() {
       : null;
   const [sourceType, setSourceType] = useState(initialSource ? 'drive' : 'url');
   const [source, setSource] = useState(initialSource);
+  const [storage, setStorage] = useState(null);
   // The source is still known when a conversion fails, so it can be started
   // again without picking the file a second time.
   const retrySource = initialSource || (source?.streamId ? source : null);
-  const [url, setUrl] = useState('');
+  const [url, setUrl] = useState(urlParam);
   const [audioTrack, setAudioTrack] = useState('');
   const [resolution, setResolution] = useState('original');
   const [roomCode, setRoomCode] = useState(roomId);
@@ -38,6 +50,14 @@ export default function Convert() {
   const roomReceivedRef = useRef(false);
   const publishedStreamRef = useRef('');
   const { job, error, start, convert, cancel } = useConversion();
+
+  useEffect(() => {
+    let active = true;
+    void fetchMyStorage()
+      .then((result) => { if (active) setStorage(result); })
+      .catch(() => { /* storage is informational, not required */ });
+    return () => { active = false; };
+  }, []);
   const busy = Boolean(job && ['queued', 'downloading', 'analyzing', 'converting'].includes(job.status));
   const startedRef = useRef(false);
   const stage = useMemo(() => {
@@ -73,10 +93,39 @@ export default function Convert() {
     void start({ streamId: initialSource.streamId }, { autoStart: true, resolution: 'original' });
   }, [initialSource, start]);
 
+  // When a link-only platform hands us a URL, pre-fill it. Auto-start only
+  // when explicitly requested (?auto=1); otherwise let the user pick options.
+  useEffect(() => {
+    if (startedRef.current) return;
+    if (!urlParam || !autoParam) return;
+    startedRef.current = true;
+    void start({ url: urlParam.trim() }, { autoStart: true, resolution: 'original' });
+  }, [urlParam, autoParam, start]);
+
   useEffect(() => {
     if (requestId || !roomId) return;
     setRequestId(getConvertRequestId(roomId));
   }, [requestId, roomId]);
+
+  // If a conversion fails, mark the matching pending queue item as failed so
+  // the room can skip it instead of waiting forever.
+  useEffect(() => {
+    if (job?.status !== 'failed' || !roomId) return;
+    let active = true;
+    void (async () => {
+      try {
+        const queue = await fetchQueue(roomId);
+        const items = Array.isArray(queue?.items) ? queue.items : [];
+        const pending = items.find((item) => item.status === 'pending' && (item.url === url.trim() || item.jobId === job.id));
+        if (pending && active) {
+          await patchQueueItem(roomId, pending.id, { status: 'failed' });
+        }
+      } catch {
+        /* best-effort */
+      }
+    })();
+    return () => { active = false; };
+  }, [job?.status, roomId, url, job?.id]);
 
   // Listen for the room tab confirming it applied the video. This is
   // registered before the video is published so the reply is never missed.
@@ -103,7 +152,7 @@ export default function Convert() {
     const publish = () => {
       if (cancelled || roomReceivedRef.current) return;
       attempts += 1;
-      publishConvertedVideo({ roomId, requestId, streamId, name });
+      publishConvertedVideo({ roomId, requestId, streamId, name, jobId: job.id, url: url.trim() || undefined });
     };
     setSentToRoom(true);
     publish();
@@ -162,6 +211,8 @@ export default function Convert() {
         requestId,
         streamId: job.outputStreamId,
         name: job.sourceName || 'Converted video',
+        jobId: job.id,
+        url: url.trim() || undefined,
       });
       setSentToRoom(true);
       focusRoomTab();
@@ -209,6 +260,18 @@ export default function Convert() {
           <p className="mt-4 rounded-md border border-zinc-200/80 bg-white px-3 py-2 text-xs leading-5 text-zinc-600 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-400">
             Converting in this tab so room <span className="font-mono font-medium text-zinc-900 dark:text-zinc-100">{roomId}</span> keeps playing.
             The finished video is sent to the room automatically.
+          </p>
+        ) : null}
+
+        {storage ? (
+          <p className="mt-3 text-xs text-zinc-500 dark:text-zinc-400">
+            Storage: {formatBytes(storage.usedBytes)} of {formatBytes(storage.quotaBytes)} used
+            {storage.reservedBytes > 0 ? ` (${formatBytes(storage.reservedBytes)} reserved)` : ''}.
+            {storage.usedBytes >= storage.quotaBytes ? (
+              <span className="ml-1 font-medium text-red-600 dark:text-red-400">
+                Quota reached — delete a conversion to free space.
+              </span>
+            ) : null}
           </p>
         ) : null}
 

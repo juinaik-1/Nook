@@ -242,10 +242,57 @@ export function getUserActiveStreams(userId) {
       streamId: record.streamId,
       name: record.name,
       expiresAt: record.expiresAt,
+      size: Number(record.size || 0),
     });
   }
   // The newest conversion expires last, so it is offered first.
   return active.sort((a, b) => b.expiresAt - a.expiresAt);
+}
+
+// The total bytes this user has consumed with converted videos.
+export function getUserStorageUsed(userId) {
+  const now = Date.now();
+  let total = 0;
+  for (const record of records.values()) {
+    if (record.ownerUserId !== userId) continue;
+    if (record.kind !== 'file') continue;
+    // An expired or already-deleted file must not count against the quota,
+    // otherwise a user could be blocked from converting even though the file
+    // is no longer served (it is freed by the cleanup sweep shortly after).
+    if (!record.expiresAt || record.expiresAt <= now) continue;
+    if (!record.filePath || !fs.existsSync(record.filePath)) continue;
+    total += Number(record.size || 0);
+  }
+  return total;
+}
+
+// Delete every converted video owned by this user. Used by the bulk "clear all"
+// action. Streams that cannot be removed from disk (for example because a
+// room is still streaming them) are dropped from the registry but reported
+// back so the caller can say what was freed.
+export function deleteAllUserStreams(userId) {
+  const owned = [...records.values()].filter(
+    (record) => record.ownerUserId === userId && record.kind === 'file',
+  );
+  let deleted = 0;
+  let bytesFreed = 0;
+  owned.forEach((record) => {
+    records.delete(record.streamId);
+    if (record.filePath) {
+      try {
+        fs.rmSync(record.filePath, { force: true });
+      } catch (error) {
+        if (!['EBUSY', 'EPERM', 'ENOENT'].includes(error.code)) throw error;
+        // The file is in use or already gone. The registry entry is removed
+        // anyway, so the file is no longer offered; the cleanup sweep will
+        // remove it once it is no longer referenced.
+      }
+    }
+    deleted += 1;
+    bytesFreed += Number(record.size || 0);
+  });
+  if (deleted) persistRecords();
+  return { deleted, bytesFreed };
 }
 
 export function getStreamAccess(streamId) {
@@ -264,7 +311,14 @@ export function deleteStream(streamId) {
   if (!record) return null;
   records.delete(streamId);
   if (record.kind === 'file' && path.dirname(path.resolve(record.filePath)) === path.resolve(config.downloadDir)) {
-    fs.rmSync(record.filePath, { force: true });
+    try {
+      fs.rmSync(record.filePath, { force: true });
+    } catch (error) {
+      if (!['EBUSY', 'EPERM', 'ENOENT'].includes(error.code)) throw error;
+      // The file is in use (for example by a room that is still playing it)
+      // or already gone. The registry entry is removed, so the file is no
+      // longer offered; the cleanup sweep removes it once it is unreferenced.
+    }
   }
   persistRecords();
   return record;
@@ -448,8 +502,4 @@ export async function serveStream(req, res) {
     else if (!res.destroyed) res.destroy();
   });
   file.pipe(res);
-}
-
-export function validateStreamTokenForTests(token) {
-  return verifyStreamToken(token);
 }

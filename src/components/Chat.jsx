@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
-import { MessageSquare, Send } from 'lucide-react';
-import { escapePlainText } from '../utils/videoUrl';
+import { MessageSquare, Send, Smile } from 'lucide-react';
 import { Avatar, Badge, Button, EmptyState, PanelHeader, textareaClass } from './ui';
+import EmojiPicker from './EmojiPicker';
 import { cn } from '../utils/cn';
+import { countGraphemes } from '../utils/graphemes';
 
 const GROUP_WINDOW_MS = 5 * 60 * 1000;
 
@@ -45,13 +46,37 @@ function isContinuation(message, previous) {
 export default function Chat({ messages, onSendMessage, currentUserId, displayName, className }) {
   const inputRef = useRef(null);
   const scrollRef = useRef(null);
+  const selectionRef = useRef({ start: 0, end: 0 });
   const [draftLength, setDraftLength] = useState(0);
+  const [pickerOpen, setPickerOpen] = useState(false);
 
   useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
   }, [messages]);
+
+  const syncSelection = () => {
+    const el = inputRef.current;
+    if (!el) return;
+    selectionRef.current = {
+      start: el.selectionStart ?? el.value.length,
+      end: el.selectionEnd ?? el.selectionStart ?? el.value.length,
+    };
+  };
+
+  const insertText = (text) => {
+    const el = inputRef.current;
+    if (!el) return;
+    const { start, end } = selectionRef.current;
+    const next = el.value.slice(0, start) + text + el.value.slice(end);
+    el.value = next;
+    const caret = start + text.length;
+    el.setSelectionRange(caret, caret);
+    selectionRef.current = { start: caret, end: caret };
+    el.focus();
+    setDraftLength(countGraphemes(next));
+  };
 
   const handleSubmit = (event) => {
     event.preventDefault();
@@ -60,15 +85,26 @@ export default function Chat({ messages, onSendMessage, currentUserId, displayNa
     if (!value.trim()) {
       return;
     }
+    if (countGraphemes(value) > 500) {
+      return;
+    }
 
     onSendMessage(value);
     if (inputRef.current) {
       inputRef.current.value = '';
     }
     setDraftLength(0);
+    setPickerOpen(false);
   };
 
   const handleComposerKeyDown = (event) => {
+    if (event.key === 'Escape') {
+      if (pickerOpen) {
+        event.preventDefault();
+        setPickerOpen(false);
+        return;
+      }
+    }
     if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
       event.preventDefault();
       handleSubmit(event);
@@ -99,7 +135,11 @@ export default function Chat({ messages, onSendMessage, currentUserId, displayNa
         {messages.length ? (
           <div className="flex flex-col gap-0.5">
             {messages.map((message, index) => {
-              const isOwn = message.name === displayName && message.user_id === currentUserId;
+              // A live message carries the participant id. A message loaded from
+              // the database only carries the name, which is unique in the
+              // room, so the name identifies the sender there.
+              const isOwn = message.user_id === currentUserId
+                || (message.name === displayName && message.user_id === message.name);
               const isSystem = message.type === 'system';
               const continuation = isContinuation(message, messages[index - 1]);
 
@@ -111,7 +151,7 @@ export default function Chat({ messages, onSendMessage, currentUserId, displayNa
                   >
                     <div className="h-px flex-1 bg-zinc-200/80 dark:bg-zinc-800" />
                     <p className="max-w-[75%] text-center text-2xs leading-4 text-zinc-500 dark:text-zinc-400">
-                      {escapePlainText(message.text || '')}
+                      {message.text || ''}
                     </p>
                     <div className="h-px flex-1 bg-zinc-200/80 dark:bg-zinc-800" />
                   </div>
@@ -135,7 +175,7 @@ export default function Chat({ messages, onSendMessage, currentUserId, displayNa
                       {continuation ? null : (
                         <div className="flex items-baseline gap-2">
                           <span className="truncate text-xs font-medium text-zinc-900 dark:text-zinc-100">
-                            {escapePlainText(message.name || 'Guest')}
+                            {message.name || 'Guest'}
                           </span>
                           {isOwn ? (
                             <span className="shrink-0 text-2xs font-medium text-indigo-600 dark:text-indigo-400">
@@ -154,7 +194,7 @@ export default function Chat({ messages, onSendMessage, currentUserId, displayNa
                           continuation ? 'mt-0' : 'mt-0.5',
                         )}
                       >
-                        {escapePlainText(message.text || '')}
+                        {message.text || ''}
                       </p>
                     </div>
                   </div>
@@ -181,28 +221,46 @@ export default function Chat({ messages, onSendMessage, currentUserId, displayNa
         className="shrink-0 border-t border-zinc-200/80 p-3 dark:border-zinc-800"
         onSubmit={handleSubmit}
       >
-        <div className="flex items-end gap-2">
+        <div className="relative flex items-end gap-2">
+          {pickerOpen ? (
+            <EmojiPicker
+              onPick={insertText}
+              onClose={() => setPickerOpen(false)}
+            />
+          ) : null}
           <textarea
             ref={inputRef}
             className={cn(textareaClass, 'max-h-24 min-h-9 flex-1')}
             rows={1}
-            maxLength={500}
+            maxLength={2000}
             placeholder="Send a message"
             aria-label="Message"
-            onChange={(event) => setDraftLength(event.target.value.length)}
+            onChange={(event) => setDraftLength(countGraphemes(event.target.value))}
             onKeyDown={handleComposerKeyDown}
+            onSelect={syncSelection}
+            onKeyUp={syncSelection}
+            onClick={syncSelection}
           />
-          <Button type="submit" size="icon" aria-label="Send message">
+          <Button
+            type="button"
+            variant="secondary"
+            size="icon"
+            aria-label="Open emoji and symbol picker"
+            onClick={() => setPickerOpen((open) => !open)}
+          >
+            <Smile className="h-4 w-4" strokeWidth={1.75} />
+          </Button>
+          <Button type="submit" size="icon" aria-label="Send message" disabled={draftLength > 500}>
             <Send className="h-4 w-4" strokeWidth={1.75} />
           </Button>
         </div>
 
-        <div className="mt-2 flex items-center justify-between gap-3 px-1 text-2xs text-zinc-500 dark:text-zinc-400">
-          <span className="hidden sm:inline">Enter to send · Shift + Enter for a new line</span>
+        <div className="mt-2 flex items-center justify-end gap-3 px-1 text-2xs text-zinc-500 dark:text-zinc-400">
           <span
             className={cn(
               'ml-auto tabular-nums',
-              draftLength >= 400 && 'font-medium text-zinc-600 dark:text-zinc-300',
+              draftLength > 500 && 'font-medium text-red-600 dark:text-red-400',
+              draftLength >= 400 && draftLength <= 500 && 'font-medium text-zinc-600 dark:text-zinc-300',
             )}
           >
             {draftLength > 0 ? `${draftLength}/500` : ''}
