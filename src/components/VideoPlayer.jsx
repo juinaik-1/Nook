@@ -28,10 +28,12 @@ export default function VideoPlayer({
   url, streamId, streamName, playing, time, roomTime, duration = 0, canControl, canConvert = true,
   loading, error, syncNonce = 0, onPlayPause, onSeek, onProgress, onDuration, onLoadVideo, onVideoError, onReady,
   onConvert, onQueueAdd, onPlayNext, onEnded, hasQueueItems = false,
+  isTheaterMode = false, onToggleTheater, theaterToast = null,
 }) {
   const playerRef = useRef(null);
   const [inputValue, setInputValue] = useState('');
   const [localError, setLocalError] = useState('');
+  const [theaterControlsVisible, setTheaterControlsVisible] = useState(true);
   const [autoplayBlocked, setAutoplayBlocked] = useState(false);
   const [activated, setActivated] = useState(false);
   const [playerMuted, setPlayerMuted] = useState(true);
@@ -348,10 +350,43 @@ export default function VideoPlayer({
   const positionLabel = formatTimestamp(roomTime);
   const showUnmute = playerMuted && playing && url;
 
+  useEffect(() => {
+    if (isTheaterMode && typeof window !== 'undefined' && window.innerWidth < 640) {
+      onToggleTheater?.();
+    }
+  }, [isTheaterMode, onToggleTheater]);
+
+  useEffect(() => {
+    if (!isTheaterMode) return undefined;
+    const onKey = (e) => {
+      if (e.key === 'Escape') onToggleTheater?.();
+      if (e.key === 'ArrowRight') { e.preventDefault(); onSeek?.((time || 0) + 10); }
+      if (e.key === 'ArrowLeft') { e.preventDefault(); onSeek?.(Math.max(0, (time || 0) - 10)); }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [isTheaterMode, onToggleTheater, time, onSeek]);
+
+  useEffect(() => {
+    if (!isTheaterMode) return undefined;
+    let timer;
+    const show = () => {
+      setTheaterControlsVisible(true);
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => setTheaterControlsVisible(false), 3000);
+    };
+    show();
+    window.addEventListener('mousemove', show);
+    return () => {
+      window.removeEventListener('mousemove', show);
+      window.clearTimeout(timer);
+    };
+  }, [isTheaterMode]);
+
   return (
-    <div className="flex flex-col gap-3">
+    <div className={isTheaterMode ? 'fixed inset-0 w-screen h-screen z-50 bg-black flex flex-col items-center justify-center' : 'flex flex-col gap-3'}>
       <Panel className="overflow-hidden">
-        <div className="relative aspect-video w-full overflow-hidden bg-zinc-950">
+        <div className={isTheaterMode ? 'relative w-screen h-screen overflow-hidden bg-black' : 'relative aspect-video w-full overflow-hidden bg-zinc-950'}>
           <div className={cn('absolute inset-0', !canControl && 'pointer-events-none')}>
           {url ? (useNativePlayer ? (
             <>
@@ -521,8 +556,35 @@ export default function VideoPlayer({
             </button>
           ) : null}
           {loading ? <div role="status" aria-label="Loading video" className="absolute inset-0 animate-pulse bg-zinc-950/60" /> : null}
+          {isTheaterMode && theaterToast ? (
+            <div className="absolute top-6 right-6 bg-black/80 text-white px-4 py-2 rounded-full z-[60] truncate max-w-xs">
+              {theaterToast}
+            </div>
+          ) : null}
+          {isTheaterMode ? (
+            <button
+              type="button"
+              onClick={onToggleTheater}
+              className={`absolute top-4 right-4 z-[60] rounded-md bg-black/70 px-3 py-1.5 text-sm text-white hover:bg-black/90 transition-opacity ${theaterControlsVisible ? 'opacity-100' : 'opacity-0'}`}
+            >
+              Exit (Esc)
+            </button>
+          ) : null}
+          {isTheaterMode ? (
+            <div
+              className={`absolute bottom-6 left-1/2 -translate-x-1/2 z-[60] flex items-center gap-3 rounded-full bg-black/70 px-4 py-2 text-white transition-opacity ${theaterControlsVisible ? 'opacity-100' : 'opacity-0'}`}
+            >
+              <button type="button" onClick={() => onPlayPause?.(!playing)} className="text-sm">
+                {playing ? 'Pause' : 'Play'}
+              </button>
+              <button type="button" onClick={onToggleTheater} className="text-sm">
+                Exit
+              </button>
+            </div>
+          ) : null}
+
         </div>
-        <div className="flex flex-wrap items-center justify-between gap-2 border-t border-zinc-200/80 px-3 py-2 dark:border-zinc-800">
+        <div className="flex flex-wrap items-center justify-between gap-1.5 border-t border-zinc-200/80 px-2 py-1.5 sm:gap-2 sm:px-3 sm:py-2 dark:border-zinc-800">
           <div className="flex flex-wrap items-center gap-1.5">
             <Badge tone={url ? 'accent' : 'neutral'} dot>{isStream ? streamName || 'Drive stream' : url ? 'Video link' : 'No source'}</Badge>
             {url ? (
@@ -533,14 +595,19 @@ export default function VideoPlayer({
                 <span className="inline-block w-11 text-left">{durationLabel || '--:--'}</span>
               </Badge>
             ) : null}
+
             {url ? <Badge tone={playing ? 'success' : 'warning'} dot>{playing ? 'Playing' : 'Paused'}</Badge> : null}
           </div>
-          <div className="flex items-center gap-1.5 text-[11px] text-zinc-500 dark:text-zinc-400">
+          <div className="hidden items-center gap-1.5 text-[11px] text-zinc-500 dark:text-zinc-400 sm:flex">
             <Radio className="h-3.5 w-3.5" />{canControl ? 'You can control playback' : 'Host controls playback'}
           </div>
+          <Button variant="secondary" size="sm" className="hidden sm:inline-flex" onClick={onToggleTheater}>
+            {isTheaterMode ? 'Exit Theater' : 'Theater'}
+          </Button>
         </div>
       </Panel>
-      <form className="flex flex-col gap-2 sm:flex-row" onSubmit={submit}>
+      {!isTheaterMode ? (
+      <form className="flex flex-row items-center gap-1.5 sm:gap-2" onSubmit={submit}>
         <div className="relative min-w-0 flex-1">
           <Link2 className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-400" />
           <input
@@ -586,6 +653,7 @@ export default function VideoPlayer({
           </Button>
         ) : null}
       </form>
+      ) : null}
       {localError || error ? (
         <p role="alert" className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs leading-5 text-red-700 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-300">
           {localError || error}
