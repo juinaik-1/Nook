@@ -26,6 +26,7 @@ import { useQueue } from '../hooks/useQueue';
 import { isConversionRequired } from '../utils/platforms';
 import { useVideoSync } from '../hooks/useVideoSync';
 import { useVoice } from '../hooks/useVoice';
+import { useVisualViewport } from '../hooks/useVisualViewport';
 import { cn } from '../utils/cn';
 import { resolveDisplayNames } from '../utils/displayNames';
 import { acknowledgeConvertedVideo, getConvertRequestId, openConvertTab, subscribeConvertedVideo } from '../utils/roomBridge';
@@ -51,6 +52,19 @@ export default function Room() {
   const [hostOnlyControls, setHostOnlyControls] = useState(false);
   const [copyStatus, setCopyStatus] = useState('');
   const [readyVideo, setReadyVideo] = useState('');
+  const prevMsgCountRef = useRef(0);
+  const popAudioRef = useRef(null);
+  const [isTheaterMode, setIsTheaterMode] = useState(false);
+  const [isChatMuted, setIsChatMuted] = useState(() => (typeof window !== 'undefined' ? localStorage.getItem('Nook-chat-muted') === '1' : false));
+  const toggleChatMuted = () => {
+    setIsChatMuted((prev) => {
+      const next = !prev;
+      try { localStorage.setItem('Nook-chat-muted', next ? '1' : '0'); } catch { /* ignore */ }
+      return next;
+    });
+  };
+  const [theaterToast, setTheaterToast] = useState(null);
+  const viewportHeight = useVisualViewport();
 
   // A finished conversion is announced with a short toast. It clears itself so
   // a stale message never lingers in the room.
@@ -291,6 +305,32 @@ export default function Room() {
   }, [location.key, location.state, navigate, roomKey, video.loadStream]);
 
   const chat = useChat({ roomId: roomKey, channel, displayName: myDisplayName, userId });
+
+  useEffect(() => {
+    const msgs = chat.messages || [];
+    if (msgs.length <= prevMsgCountRef.current) {
+      prevMsgCountRef.current = msgs.length;
+      return;
+    }
+    const last = msgs[msgs.length - 1];
+    prevMsgCountRef.current = msgs.length;
+    if (!last || last.user_id === userId) return;
+    const text = last.text || '';
+    const isMobile = typeof window !== 'undefined' && window.innerWidth < 640;
+    if (!isChatMuted && (isTheaterMode || isMobile)) {
+      try {
+        if (!popAudioRef.current) popAudioRef.current = new Audio('/audio/pop.mp3');
+        popAudioRef.current.currentTime = 0;
+        popAudioRef.current.play().catch(() => {});
+      } catch { /* ignore */ }
+      try { navigator.vibrate?.(120); } catch { /* ignore */ }
+    }
+    if (isTheaterMode) {
+      setTheaterToast(`${last.name || 'Someone'}: ${text}`);
+      const t = window.setTimeout(() => setTheaterToast(null), 3000);
+      return () => window.clearTimeout(t);
+    }
+  }, [chat.messages, isChatMuted, isTheaterMode, userId]);
   const voice = useVoice({
     roomId: roomKey,
     channel,
@@ -427,8 +467,9 @@ export default function Room() {
       <main className="mx-auto max-w-[1440px] px-4 py-4 sm:px-6 sm:py-6">
         <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_360px] lg:items-start lg:gap-6">
           <div className="flex min-w-0 flex-col gap-4">
-            <VideoPlayer
-              url={video.url}
+            <div className="sticky top-0 z-20 -mx-4 bg-zinc-50 px-4 py-2 dark:bg-zinc-950 sm:-mx-6 sm:px-6 lg:static lg:mx-0 lg:bg-transparent lg:p-0">
+              <VideoPlayer
+                url={video.url}
               streamId={video.streamId}
               streamName={video.streamName}
               playing={video.playing}
@@ -469,7 +510,10 @@ export default function Room() {
               }}
               onConvert={openConverter}
               onPlayNext={() => { void playNextQueued(); }}
-              hasQueueItems={queue.items.length > 0}
+               isTheaterMode={isTheaterMode}
+               onToggleTheater={() => setIsTheaterMode((v) => !v)}
+               theaterToast={theaterToast}
+               hasQueueItems={queue.items.length > 0}
               onQueueAdd={async (normalized) => {
                 try {
                   if (isConversionRequired(normalized)) {
@@ -500,6 +544,20 @@ export default function Room() {
                 }
               }}
             />
+
+            </div>
+
+            <div className="lg:hidden">
+              <Chat
+                messages={chat.messages}
+                onSendMessage={chat.sendMessage}
+                currentUserId={userId}
+                displayName={myDisplayName}
+                className="h-[calc(100dvh-400px)] min-h-[200px]"
+                isChatMuted={isChatMuted}
+                onToggleMute={toggleChatMuted}
+              />
+            </div>
 
             {user ? (
               <>
@@ -573,7 +631,6 @@ export default function Room() {
             <UserList
               users={peopleWithNames}
               hostId={hostId}
-              currentUserId={userId}
               onTransferHost={(targetUserId) => transferHost(targetUserId, hostOnlyControls)}
               speakingUsers={voice.remoteUsers.map((user) => user.userId).filter(Boolean)}
               isConnected={isConnected}
@@ -581,13 +638,17 @@ export default function Room() {
             />
           </div>
 
-          <Chat
-            messages={chat.messages}
-            onSendMessage={chat.sendMessage}
-            currentUserId={userId}
-            displayName={myDisplayName}
-            className="h-[560px] min-h-[420px] lg:sticky lg:top-[72px] lg:h-[calc(100vh-88px)]"
-          />
+          <div className="hidden lg:block">
+            <Chat
+              messages={chat.messages}
+              onSendMessage={chat.sendMessage}
+              currentUserId={userId}
+              displayName={myDisplayName}
+              className="h-[560px] min-h-[420px] lg:sticky lg:top-[72px] lg:h-[calc(100vh-88px)]"
+              isChatMuted={isChatMuted}
+              onToggleMute={toggleChatMuted}
+            />
+          </div>
         </div>
       </main>
 

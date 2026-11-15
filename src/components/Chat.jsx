@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from 'react';
-import { MessageSquare, Send, Smile } from 'lucide-react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { MessageSquare, Send, Smile, Volume2, VolumeX } from 'lucide-react';
 import { Avatar, Badge, Button, EmptyState, PanelHeader, textareaClass } from './ui';
 import EmojiPicker from './EmojiPicker';
 import { cn } from '../utils/cn';
@@ -43,14 +43,14 @@ function isContinuation(message, previous) {
   return currentTime - previousTime < GROUP_WINDOW_MS;
 }
 
-export default function Chat({ messages, onSendMessage, currentUserId, displayName, className }) {
+export default function Chat({ messages, onSendMessage, currentUserId, displayName, className, isChatMuted = false, onToggleMute }) {
   const inputRef = useRef(null);
   const scrollRef = useRef(null);
   const selectionRef = useRef({ start: 0, end: 0 });
   const [draftLength, setDraftLength] = useState(0);
   const [pickerOpen, setPickerOpen] = useState(false);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
@@ -249,6 +249,9 @@ export default function Chat({ messages, onSendMessage, currentUserId, displayNa
             onClick={() => setPickerOpen((open) => !open)}
           >
             <Smile className="h-4 w-4" strokeWidth={1.75} />
+          </Button>
+          <Button type="button" size="icon" aria-label="Toggle chat mute" onClick={onToggleMute} style={isChatMuted ? { opacity: 0.4 } : undefined}>
+            {isChatMuted ? <VolumeX className="h-4 w-4" strokeWidth={1.75} /> : <Volume2 className="h-4 w-4" strokeWidth={1.75} />}
           </Button>
           <Button type="submit" size="icon" aria-label="Send message" disabled={draftLength > 500}>
             <Send className="h-4 w-4" strokeWidth={1.75} />
