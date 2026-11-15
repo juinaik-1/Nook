@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import ReactPlayer from 'react-player';
-import { Clock, Link2, MonitorPlay, Radio, VolumeX, WandSparkles } from 'lucide-react';
+import { Clock, Link2, MonitorPlay, Pause, Play, Radio, VolumeX, WandSparkles } from 'lucide-react';
 import { Badge, Button, Panel, inputClass } from './ui';
 import { normalizeVideoUrl } from '../utils/videoUrl';
 import { isConversionRequired, isEmbeddable, matchPlatform, platformLabel } from '../utils/platforms';
@@ -25,7 +25,7 @@ function formatTimestamp(value) {
 }
 
 export default function VideoPlayer({
-  url, streamId, streamName, playing, time, roomTime, duration = 0, canControl, canConvert = true,
+  url, streamId, streamName, mediaItem = null, playing, time, roomTime, duration = 0, canControl, canConvert = true,
   loading, error, syncNonce = 0, onPlayPause, onSeek, onProgress, onDuration, onLoadVideo, onVideoError, onReady,
   onConvert, onQueueAdd, onPlayNext, onEnded, hasQueueItems = false,
   isTheaterMode = false, onToggleTheater, theaterToast = null,
@@ -68,6 +68,13 @@ export default function VideoPlayer({
   const isStream = Boolean(streamId);
   const isDriveMedia = Boolean(url && /^https:\/\/drive\.google\.com\/uc\?/.test(url));
   const useNativePlayer = isStream || isDriveMedia;
+  const isAudio = Boolean(
+    (mediaItem && (mediaItem.type === 'audio' || String(mediaItem.url || '').endsWith('.mp4'))) ||
+    (url && String(url).endsWith('.mp4')),
+  );
+  const audioThumb = mediaItem?.thumbnailUrl || '';
+  const audioTitle = mediaItem?.title || streamName || '';
+  const audioArtist = mediaItem?.author || '';
 
   // Reset the mute state during render so a newly mounted player is created
   // muted from the very first paint (the embedded player only reads `muted` at
@@ -357,6 +364,10 @@ export default function VideoPlayer({
   }, [isTheaterMode, onToggleTheater]);
 
   useEffect(() => {
+    if (isAudio && isTheaterMode) onToggleTheater?.();
+  }, [isAudio, isTheaterMode, onToggleTheater]);
+
+  useEffect(() => {
     if (!isTheaterMode) return undefined;
     const onKey = (e) => {
       if (e.key === 'Escape') onToggleTheater?.();
@@ -388,7 +399,165 @@ export default function VideoPlayer({
       <Panel className="overflow-hidden">
         <div className={isTheaterMode ? 'relative w-screen h-screen overflow-hidden bg-black' : 'relative aspect-video w-full overflow-hidden bg-zinc-950'}>
           <div className={cn('absolute inset-0', !canControl && 'pointer-events-none')}>
-          {url ? (useNativePlayer ? (
+          {url ? (isAudio ? (
+            <>
+              <audio
+                key={url}
+                ref={playerRef}
+                src={url}
+                controls={canControl}
+                preload="metadata"
+                muted={playerMuted}
+                className="hidden"
+                onLoadedMetadata={(event) => {
+                  if (time > 0) event.currentTarget.currentTime = time;
+                  onReady?.({ autoplay: false });
+                  syncPlayback();
+                  syncTime();
+                }}
+                onPlay={(event) => {
+                  playingRef.current = true;
+                  if (activated) {
+                    event.currentTarget.muted = false;
+                    setPlayerMuted(false);
+                  }
+                  if (consumeProgrammaticEvent('play')) return;
+                  if (playing) return;
+                  if (!canControl) {
+                    markProgrammaticPause();
+                    event.currentTarget.pause();
+                    return;
+                  }
+                  setAutoplayBlocked(false);
+                  setLocalError('');
+                  onPlayPause?.(true);
+                }}
+                onPause={() => {
+                  playingRef.current = false;
+                  if (!playing) return;
+                  if (!canControl) {
+                    reassertRoomState();
+                    return;
+                  }
+                  onPlayPause?.(false);
+                }}
+                onEnded={() => (onEnded ? onEnded() : onPlayPause?.(false))}
+                onTimeUpdate={(event) => onProgress?.(event.currentTarget.currentTime)}
+                onDurationChange={(event) => onDuration?.(event.currentTarget.duration)}
+                onSeeked={(event) => {
+                  if (!canControl) {
+                    reassertRoomState();
+                    return;
+                  }
+                  reportSeek(event.currentTarget.currentTime);
+                }}
+                onError={(event) => {
+                  const message = event.currentTarget.error?.code
+                    ? `This audio failed to load (media error ${event.currentTarget.error.code}).`
+                    : 'This audio failed to load.';
+                  setLocalError(message);
+                  onVideoError?.(message);
+                }}
+              />
+              <div className="absolute inset-0">
+                {audioThumb ? (
+                  <img
+                    src={audioThumb}
+                    alt=""
+                    aria-hidden="true"
+                    className="absolute inset-0 h-full w-full scale-125 object-cover blur-3xl opacity-40"
+                  />
+                ) : null}
+                <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 px-4 pb-16 pt-3 text-center sm:gap-4 sm:px-6 sm:pb-4">
+                  {audioThumb ? (
+                    <img
+                      src={audioThumb}
+                      alt={audioTitle}
+                      className="h-24 w-24 rounded-2xl object-cover shadow-2xl sm:h-48 sm:w-48"
+                    />
+                  ) : null}
+                  <div>
+                    <p className="text-lg font-semibold text-zinc-100 sm:text-xl">{audioTitle}</p>
+                    {audioArtist ? <p className="text-sm text-zinc-400">{audioArtist}</p> : null}
+                  </div>
+                  {canControl ? (
+                    <div className="hidden sm:flex flex-col gap-3 w-full max-w-md mx-auto">
+                      <div className="flex items-center justify-center">
+                        <button
+                          type="button"
+                          onClick={() => onPlayPause?.(!playing)}
+                          aria-label={playing ? 'Pause' : 'Play'}
+                          className="w-12 h-12 flex items-center justify-center rounded-full bg-white text-black hover:bg-gray-200 transition-colors"
+                        >
+                          {playing ? <Pause className="h-5 w-5" /> : <Play className="h-5 w-5" />}
+                        </button>
+                      </div>
+                      <div className="flex items-center gap-3 w-full group">
+                        <span className="text-xs font-medium text-zinc-400 tabular-nums">{formatTimestamp(roomTime)}</span>
+                        <div className="relative flex-1 h-1 rounded-full bg-zinc-700">
+                          <div
+                            className="absolute left-0 top-0 h-1 rounded-full bg-white"
+                            style={{ width: `${duration ? Math.min(100, (Number(roomTime || 0) / duration) * 100) : 0}%` }}
+                          />
+                          <input
+                            type="range"
+                            min={0}
+                            max={duration || 0}
+                            step={0.1}
+                            value={Number.isFinite(roomTime) ? roomTime : 0}
+                            onChange={(event) => onSeek?.(Number(event.target.value), { userInitiated: true })}
+                            className="absolute inset-0 w-full h-1 opacity-0 cursor-pointer"
+                            aria-label="Seek"
+                          />
+                          <div
+                            className="absolute top-1/2 -translate-y-1/2 w-3 h-3 rounded-full bg-white shadow-md scale-0 group-hover:scale-100 group-focus-within:scale-100 transition-transform pointer-events-none"
+                            style={{ left: `calc(${duration ? Math.min(100, (Number(roomTime || 0) / duration) * 100) : 0}% - 6px)` }}
+                          />
+                        </div>
+                        <span className="text-xs font-medium text-zinc-400 tabular-nums">{formatDuration(duration) || '--:--'}</span>
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+                {canControl ? (
+                  <div className="sm:hidden absolute bottom-0 left-0 right-0 flex items-center gap-3 bg-black/60 px-3 py-2 backdrop-blur">
+                    <button
+                      type="button"
+                      onClick={() => onPlayPause?.(!playing)}
+                      aria-label={playing ? 'Pause' : 'Play'}
+                      className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-white text-black hover:bg-gray-200 transition-colors"
+                    >
+                      {playing ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
+                    </button>
+                    <div className="flex min-w-0 flex-1 items-center gap-2 group">
+                      <span className="text-xs font-medium text-zinc-300 tabular-nums">{formatTimestamp(roomTime)}</span>
+                      <div className="relative flex-1 h-1 rounded-full bg-zinc-600">
+                        <div
+                          className="absolute left-0 top-0 h-1 rounded-full bg-white"
+                          style={{ width: `${duration ? Math.min(100, (Number(roomTime || 0) / duration) * 100) : 0}%` }}
+                        />
+                        <input
+                          type="range"
+                          min={0}
+                          max={duration || 0}
+                          step={0.1}
+                          value={Number.isFinite(roomTime) ? roomTime : 0}
+                          onChange={(event) => onSeek?.(Number(event.target.value), { userInitiated: true })}
+                          className="absolute inset-0 w-full h-1 opacity-0 cursor-pointer"
+                          aria-label="Seek"
+                        />
+                        <div
+                          className="absolute top-1/2 -translate-y-1/2 w-3 h-3 rounded-full bg-white shadow-md scale-100 transition-transform pointer-events-none"
+                          style={{ left: `calc(${duration ? Math.min(100, (Number(roomTime || 0) / duration) * 100) : 0}% - 6px)` }}
+                        />
+                      </div>
+                      <span className="text-xs font-medium text-zinc-300 tabular-nums">{formatDuration(duration) || '--:--'}</span>
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+            </>
+          ) : (useNativePlayer ? (
             <>
               <video
                 key={streamId || url}
@@ -411,12 +580,8 @@ export default function VideoPlayer({
                     event.currentTarget.muted = false;
                     setPlayerMuted(false);
                   }
-                  // The engine started the player itself.
                   if (consumeProgrammaticEvent('play')) return;
-                  // The room already believes the video is playing, so there
-                  // is nothing to change.
                   if (playing) return;
-                  // A viewer without control must follow the host's play state.
                   if (!canControl) {
                     markProgrammaticPause();
                     event.currentTarget.pause();
@@ -428,12 +593,7 @@ export default function VideoPlayer({
                 }}
                 onPause={() => {
                   playingRef.current = false;
-                  // The room already believes the video is paused, so this is
-                  // the room's own change coming back, not a user action. The
-                  // room state is the authority here: a pause is only ever
-                  // requested programmatically when the room wanted it paused.
                   if (!playing) return;
-                  // A viewer without control stays on the room's play state.
                   if (!canControl) {
                     reassertRoomState();
                     return;
@@ -474,14 +634,9 @@ export default function VideoPlayer({
               onReady={() => { onReady?.(); syncPlayback(); syncTime(); }}
               onPlay={() => {
                 playingRef.current = true;
-                // Restore audio once the page has a user gesture.
                 if (activated) setPlayerMuted(false);
-                // The room already believes the video is playing, so this is
-                // the room's own change coming back, not a user action.
                 if (playing) return;
-                // The engine started the player itself.
                 if (consumeProgrammaticEvent('play')) return;
-                // A viewer without control must follow the host's play state.
                 if (!canControl) {
                   markProgrammaticPause();
                   const player = getPlayer();
@@ -494,12 +649,7 @@ export default function VideoPlayer({
               }}
               onPause={() => {
                 playingRef.current = false;
-                // The room already believes the video is paused, so this is
-                // the room's own change coming back, not a user action. The
-                // room state is the authority here: a pause is only ever
-                // requested programmatically when the room wanted it paused.
                 if (!playing) return;
-                // A viewer without control stays on the room's play state.
                 if (!canControl) {
                   reassertRoomState();
                   return;
@@ -522,7 +672,7 @@ export default function VideoPlayer({
                 onVideoError?.(message);
               }}
             />
-          )) : (
+          ))) : (
             <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 px-6 text-center">
               <div className="flex h-11 w-11 items-center justify-center rounded-lg border border-zinc-800 bg-zinc-900 text-zinc-400">
                 <MonitorPlay className="h-5 w-5" />
@@ -586,7 +736,7 @@ export default function VideoPlayer({
         </div>
         <div className="flex flex-wrap items-center justify-between gap-1.5 border-t border-zinc-200/80 px-2 py-1.5 sm:gap-2 sm:px-3 sm:py-2 dark:border-zinc-800">
           <div className="flex flex-wrap items-center gap-1.5">
-            <Badge tone={url ? 'accent' : 'neutral'} dot>{isStream ? streamName || 'Drive stream' : url ? 'Video link' : 'No source'}</Badge>
+            <Badge tone={url ? 'accent' : 'neutral'} dot>{isStream ? streamName || 'Drive stream' : url ? (isAudio ? 'Audio' : 'Video link') : 'No source'}</Badge>
             {url ? (
               <Badge className="tabular-nums">
                 <Clock className="h-3 w-3" />
@@ -601,9 +751,11 @@ export default function VideoPlayer({
           <div className="hidden items-center gap-1.5 text-[11px] text-zinc-500 dark:text-zinc-400 sm:flex">
             <Radio className="h-3.5 w-3.5" />{canControl ? 'You can control playback' : 'Host controls playback'}
           </div>
-          <Button variant="secondary" size="sm" className="hidden sm:inline-flex" onClick={onToggleTheater}>
-            {isTheaterMode ? 'Exit Theater' : 'Theater'}
-          </Button>
+          {!isAudio ? (
+            <Button variant="secondary" size="sm" className="hidden sm:inline-flex" onClick={onToggleTheater}>
+              {isTheaterMode ? 'Exit Theater' : 'Theater'}
+            </Button>
+          ) : null}
         </div>
       </Panel>
       {!isTheaterMode ? (

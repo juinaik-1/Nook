@@ -1,5 +1,6 @@
-import { useState } from 'react';
-import { ChevronDown, ChevronUp, Film, ListOrdered, Plus, Trash2, X } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { getAlbumSongs, getArtistSongs, searchAlbums, searchArtists, searchSongs } from '../utils/jiosaavn';
+import { ArrowLeft, ChevronDown, ChevronUp, Disc3, Film, ListOrdered, Mic2, Music2, Plus, Trash2, X } from 'lucide-react';
 import { fetchMyStreams } from '../utils/api';
 import { Button, Panel, inputClass } from './ui';
 import { cn } from '../utils/cn';
@@ -22,6 +23,11 @@ export default function QueuePanel({ queue, canControl, participantId, people = 
   );
   const upNextIndex = currentIndex >= 0 ? currentIndex + 1 : 0;
   const [inputValue, setInputValue] = useState('');
+  const [searchMode, setSearchMode] = useState('songs');
+  const [searchResults, setSearchResults] = useState([]);
+  const [drilldown, setDrilldown] = useState(null);
+  const [showSearch, setShowSearch] = useState(false);
+  const [searching, setSearching] = useState(false);
   const [adding, setAdding] = useState(false);
   const [myStreams, setMyStreams] = useState([]);
   const [showStreams, setShowStreams] = useState(false);
@@ -53,6 +59,85 @@ export default function QueuePanel({ queue, canControl, participantId, people = 
       setError(requestError.message || 'Unable to add to the queue.');
     } finally {
       setAdding(false);
+    }
+  };
+
+  useEffect(() => {
+    const trimmed = inputValue.trim();
+    if (!trimmed || /^https?:\/\//i.test(trimmed)) {
+      setSearchResults([]);
+      setShowSearch(false);
+      setDrilldown(null);
+      return undefined;
+    }
+    const timer = window.setTimeout(async () => {
+      setSearching(true);
+      try {
+        let results = [];
+        if (searchMode === 'artists') results = await searchArtists(trimmed);
+        else if (searchMode === 'albums') results = await searchAlbums(trimmed);
+        else results = await searchSongs(trimmed);
+        setSearchResults(results);
+        setDrilldown(null);
+        setShowSearch(true);
+      } catch {
+        setSearchResults([]);
+        setDrilldown(null);
+        setShowSearch(false);
+      } finally {
+        setSearching(false);
+      }
+    }, 500);
+    return () => window.clearTimeout(timer);
+  }, [inputValue, searchMode]);
+
+  const handleSelectSong = async (song) => {
+    setShowSearch(false);
+    setInputValue('');
+    setSearchResults([]);
+    setDrilldown(null);
+    setError('');
+    setAdding(true);
+    try {
+      const result = await add({
+        kind: 'url',
+        url: song.audioUrl,
+        title: song.title,
+        author: song.artist,
+        thumbnailUrl: song.thumbnailUrl,
+        type: 'audio',
+        status: 'ready',
+        addedBy: participantId,
+      });
+      if (result?.duplicate) setError('This song is already in the queue.');
+    } catch (requestError) {
+      setError(requestError.message || 'Unable to add to the queue.');
+    } finally {
+      setAdding(false);
+    }
+  };
+
+  const handleSelectArtist = async (artist) => {
+    setSearching(true);
+    try {
+      const songs = await getArtistSongs(artist.id, artist.name);
+      setDrilldown({ type: 'artist', title: artist.name, songs });
+    } catch {
+      setError('Unable to load artist songs.');
+    } finally {
+      setSearching(false);
+    }
+  };
+
+  const handleSelectAlbum = async (album) => {
+    setSearching(true);
+    try {
+      const songs = await getAlbumSongs(album.id);
+      setDrilldown({ type: 'album', title: album.name, songs });
+    } catch {
+      setError('Unable to load album songs.');
+    } finally {
+      setSearching(false);
     }
   };
 
@@ -145,19 +230,139 @@ export default function QueuePanel({ queue, canControl, participantId, people = 
       ) : null}
 
       {canEdit ? (
-        <form className="mt-3 flex gap-2" onSubmit={handleAddUrl}>
-          <input
-            className={cn(inputClass, 'flex-1')}
-            value={inputValue}
-            onChange={(event) => setInputValue(event.target.value)}
-            placeholder="Paste a video URL to queue"
-            aria-label="Queue video URL"
-            disabled={adding}
-          />
-          <Button type="submit" size="sm" variant="secondary" disabled={adding || !inputValue.trim()}>
-            <Plus className="h-3.5 w-3.5" /> Add
-          </Button>
-        </form>
+        <div className="relative mt-3">
+          <div className="mb-2 flex flex-wrap gap-1.5">
+            {[
+              { id: 'songs', label: 'Songs', Icon: Music2 },
+              { id: 'artists', label: 'Artists', Icon: Mic2 },
+              { id: 'albums', label: 'Albums', Icon: Disc3 },
+            ].map(({ id, label, Icon }) => (
+              <button
+                key={id}
+                type="button"
+                onClick={() => { setSearchMode(id); setDrilldown(null); setSearchResults([]); }}
+                className={cn(
+                  'inline-flex items-center gap-1 rounded-md border px-2 py-1 text-2xs font-medium transition-colors sm:text-xs',
+                  searchMode === id
+                    ? 'border-indigo-200 bg-indigo-50 text-indigo-700 dark:border-indigo-900/50 dark:bg-indigo-950/30 dark:text-indigo-300'
+                    : 'border-zinc-200 bg-white text-zinc-600 hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800',
+                )}
+              >
+                <Icon className="h-3 w-3 sm:h-3.5 sm:w-3.5" /> {label}
+              </button>
+            ))}
+          </div>
+          <form className="flex gap-2" onSubmit={handleAddUrl}>
+            <input
+              className={cn(inputClass, 'flex-1')}
+              value={inputValue}
+              onChange={(event) => setInputValue(event.target.value)}
+              placeholder={/^https?:\/\//i.test(inputValue.trim()) ? 'Paste a link or search...' : `Paste a link or search ${searchMode}...`}
+              aria-label="Queue video URL or search"
+              disabled={adding}
+            />
+            <Button type="submit" size="sm" variant="secondary" disabled={adding || !inputValue.trim()}>
+              <Plus className="h-3.5 w-3.5" /> Add
+            </Button>
+          </form>
+          {showSearch ? (
+            <div className="absolute left-0 right-0 top-full z-50 mt-1 max-h-72 overflow-y-auto rounded-md border border-zinc-200/80 bg-white shadow-lg dark:border-zinc-800 dark:bg-zinc-900">
+              {searching ? (
+                <div className="px-3 py-2 text-xs text-zinc-500">Loading…</div>
+              ) : null}
+              {drilldown ? (
+                <>
+                  <div className="sticky top-0 flex items-center gap-2 border-b border-zinc-200/80 bg-white px-2 py-2 dark:border-zinc-800 dark:bg-zinc-900">
+                    <button type="button" onClick={() => setDrilldown(null)} className="inline-flex items-center gap-1 text-xs text-zinc-600 hover:text-zinc-900 dark:text-zinc-300 dark:hover:text-zinc-100">
+                      <ArrowLeft className="h-3.5 w-3.5" /> Back
+                    </button>
+                    <span className="min-w-0 truncate text-xs font-medium text-zinc-700 dark:text-zinc-200">{drilldown.title}</span>
+                  </div>
+                  {drilldown.songs.length ? drilldown.songs.map((song) => (
+                    <button
+                      key={song.id}
+                      type="button"
+                      onClick={() => handleSelectSong(song)}
+                      className="flex w-full items-center gap-2 px-2.5 py-2 text-left text-xs hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                    >
+                      {song.thumbnailUrl ? (
+                        <img src={song.thumbnailUrl} alt="" loading="lazy" referrerPolicy="no-referrer" className="h-9 w-9 shrink-0 rounded object-cover" />
+                      ) : (
+                        <div className="h-9 w-9 shrink-0 rounded bg-zinc-100 dark:bg-zinc-800" />
+                      )}
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate font-medium text-zinc-700 dark:text-zinc-200">{song.title}</p>
+                        <p className="truncate text-2xs text-zinc-500 dark:text-zinc-400">{song.artist}</p>
+                      </div>
+                    </button>
+                  )) : (
+                    <div className="px-3 py-2 text-xs text-zinc-500">No songs found.</div>
+                  )}
+                </>
+              ) : (
+                <>
+                  {searchMode === 'songs' ? searchResults.map((song) => (
+                    <button
+                      key={song.id}
+                      type="button"
+                      onClick={() => handleSelectSong(song)}
+                      className="flex w-full items-center gap-2 px-2.5 py-2 text-left text-xs hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                    >
+                      {song.thumbnailUrl ? (
+                        <img src={song.thumbnailUrl} alt="" loading="lazy" referrerPolicy="no-referrer" className="h-9 w-9 shrink-0 rounded object-cover" />
+                      ) : (
+                        <div className="h-9 w-9 shrink-0 rounded bg-zinc-100 dark:bg-zinc-800" />
+                      )}
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate font-medium text-zinc-700 dark:text-zinc-200">{song.title}</p>
+                        <p className="truncate text-2xs text-zinc-500 dark:text-zinc-400">{song.artist}</p>
+                      </div>
+                    </button>
+                  )) : null}
+                  {searchMode === 'artists' ? searchResults.map((artist) => (
+                    <button
+                      key={artist.id}
+                      type="button"
+                      onClick={() => handleSelectArtist(artist)}
+                      className="flex w-full items-center gap-2 px-2.5 py-2 text-left text-xs hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                    >
+                      {artist.image ? (
+                        <img src={artist.image} alt="" loading="lazy" referrerPolicy="no-referrer" className="h-9 w-9 shrink-0 rounded-full object-cover" />
+                      ) : (
+                        <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-zinc-100 text-zinc-400 dark:bg-zinc-800"><Mic2 className="h-4 w-4" /></div>
+                      )}
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate font-medium text-zinc-700 dark:text-zinc-200">{artist.name}</p>
+                        <p className="truncate text-2xs text-zinc-500 dark:text-zinc-400">Artist · tap to view songs</p>
+                      </div>
+                    </button>
+                  )) : null}
+                  {searchMode === 'albums' ? searchResults.map((album) => (
+                    <button
+                      key={album.id}
+                      type="button"
+                      onClick={() => handleSelectAlbum(album)}
+                      className="flex w-full items-center gap-2 px-2.5 py-2 text-left text-xs hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                    >
+                      {album.image ? (
+                        <img src={album.image} alt="" loading="lazy" referrerPolicy="no-referrer" className="h-9 w-9 shrink-0 rounded object-cover" />
+                      ) : (
+                        <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded bg-zinc-100 text-zinc-400 dark:bg-zinc-800"><Disc3 className="h-4 w-4" /></div>
+                      )}
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate font-medium text-zinc-700 dark:text-zinc-200">{album.name}</p>
+                        <p className="truncate text-2xs text-zinc-500 dark:text-zinc-400">{album.artist ? `${album.artist} · ` : ''}Album · tap to view songs</p>
+                      </div>
+                    </button>
+                  )) : null}
+                  {!searching && !searchResults.length ? (
+                    <div className="px-3 py-2 text-xs text-zinc-500">No results.</div>
+                  ) : null}
+                </>
+              )}
+            </div>
+          ) : null}
+        </div>
       ) : null}
 
       {canEdit ? (
@@ -224,10 +429,10 @@ export default function QueuePanel({ queue, canControl, participantId, people = 
           {items.map((item, index) => (
             <li
               key={item.id}
-              className="flex items-center gap-2 rounded-md border border-zinc-200/80 px-2.5 py-2 text-xs dark:border-zinc-800"
+              className="flex flex-wrap items-center gap-1.5 rounded-md border border-zinc-200/80 px-2 py-1.5 text-xs dark:border-zinc-800 sm:flex-nowrap sm:gap-2 sm:px-2.5 sm:py-2"
             >
-              <span className="shrink-0 text-2xs font-medium text-zinc-400">#{index + 1}</span>
-              <div className="relative h-9 w-16 flex-shrink-0 overflow-hidden rounded bg-zinc-100 dark:bg-zinc-800">
+              <span className="hidden shrink-0 text-2xs font-medium text-zinc-400 sm:inline">#{index + 1}</span>
+              <div className="relative h-8 w-12 flex-shrink-0 overflow-hidden rounded bg-zinc-100 dark:bg-zinc-800 sm:h-9 sm:w-16">
                 {item.thumbnailUrl ? (
                   <img
                     src={item.thumbnailUrl}
@@ -239,17 +444,17 @@ export default function QueuePanel({ queue, canControl, participantId, people = 
                   />
                 ) : null}
                 <div className="absolute inset-0 flex items-center justify-center text-zinc-400">
-                  <Film className="h-4 w-4" />
+                  <Film className="h-4 w-4 sm:h-4 sm:w-4" />
                 </div>
               </div>
-              <div className="min-w-0 flex-1">
+              <div className="min-w-0 flex-1 basis-24">
                 <p
                   className="truncate text-xs font-medium text-zinc-700 dark:text-zinc-200"
                   title={item.title || item.url || ''}
                 >
                   {item.title || item.url || item.streamId || 'Queued item'}
                 </p>
-                <div className="mt-0.5 flex flex-wrap items-center gap-1.5">
+                <div className="mt-0.5 flex flex-wrap items-center gap-1 sm:gap-1.5">
                   {(() => {
                     const isCurrent = (currentStreamId && item.streamId === currentStreamId)
                       || (currentUrl && item.url === currentUrl);
@@ -291,26 +496,28 @@ export default function QueuePanel({ queue, canControl, participantId, people = 
                   ) : null}
                 </div>
               </div>
-              {canEdit ? (
-                <>
-                  <Button size="sm" variant="ghost" onClick={() => handleMove(item.id, 'up')} disabled={index === 0} aria-label="Move up">
-                    <ChevronUp className="h-3.5 w-3.5" />
-                  </Button>
-                  <Button size="sm" variant="ghost" onClick={() => handleMove(item.id, 'down')} disabled={index === items.length - 1} aria-label="Move down">
-                    <ChevronDown className="h-3.5 w-3.5" />
-                  </Button>
-                  <Button size="sm" variant="secondary" onClick={() => handlePlay(item)} disabled={item.status === 'pending' || item.status === 'failed'}>
+              <div className="flex w-full items-center justify-end gap-1 sm:w-auto sm:shrink-0">
+                {canEdit ? (
+                  <>
+                    <Button size="sm" variant="ghost" className="h-8 w-8 p-0 sm:h-auto sm:w-auto sm:p-1.5" onClick={() => handleMove(item.id, 'up')} disabled={index === 0} aria-label="Move up">
+                      <ChevronUp className="h-4 w-4 sm:h-3.5 sm:w-3.5" />
+                    </Button>
+                    <Button size="sm" variant="ghost" className="h-8 w-8 p-0 sm:h-auto sm:w-auto sm:p-1.5" onClick={() => handleMove(item.id, 'down')} disabled={index === items.length - 1} aria-label="Move down">
+                      <ChevronDown className="h-4 w-4 sm:h-3.5 sm:w-3.5" />
+                    </Button>
+                    <Button size="sm" variant="secondary" className="h-8 px-2.5 text-xs sm:h-auto sm:px-3 sm:text-xs" onClick={() => handlePlay(item)} disabled={item.status === 'pending' || item.status === 'failed'}>
+                      Play
+                    </Button>
+                    <Button size="sm" variant="ghost" className="h-8 w-8 p-0 sm:h-auto sm:w-auto sm:p-1.5" onClick={() => handleRemove(item.id)} aria-label="Remove">
+                      <Trash2 className="h-4 w-4 sm:h-3.5 sm:w-3.5" />
+                    </Button>
+                  </>
+                ) : (
+                  <Button size="sm" variant="secondary" className="h-7 px-2 text-2xs sm:h-auto sm:px-3 sm:text-xs" onClick={() => handlePlay(item)} disabled={!canControl || item.status === 'pending' || item.status === 'failed'}>
                     Play
                   </Button>
-                  <Button size="sm" variant="ghost" onClick={() => handleRemove(item.id)} aria-label="Remove">
-                    <Trash2 className="h-3.5 w-3.5" />
-                  </Button>
-                </>
-              ) : (
-                <Button size="sm" variant="secondary" onClick={() => handlePlay(item)} disabled={!canControl || item.status === 'pending' || item.status === 'failed'}>
-                  Play
-                </Button>
-              )}
+                )}
+              </div>
             </li>
           ))}
         </ol>
