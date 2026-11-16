@@ -124,9 +124,15 @@ export default function Room() {
     if (hostPresence) setHostOnlyControls(Boolean(hostPresence.hostOnlyControls));
   }, [hostId, presenceUsers, isHost]);
 
+  useEffect(() => () => window.clearTimeout(hostOnlyControlsTimerRef.current), []);
+
   const changeHostOnlyControls = (value) => {
     setHostOnlyControls(value);
-    if (isHost) updatePresence({ hostOnlyControls: value });
+    if (!isHost) return;
+    window.clearTimeout(hostOnlyControlsTimerRef.current);
+    hostOnlyControlsTimerRef.current = window.setTimeout(() => {
+      updatePresence({ hostOnlyControls: value });
+    }, 250);
   };
 
   // Identifies the conversion this tab asked for. The room id is what scopes
@@ -134,6 +140,7 @@ export default function Room() {
   // tabs, not exclusive to this one.
   const convertRequestId = useRef('');
   if (!convertRequestId.current) convertRequestId.current = getConvertRequestId(roomKey);
+  const hostOnlyControlsTimerRef = useRef(0);
   // Tracks when the current video actually started playing, so a spurious
   // onEnded (e.g. a load hiccup) does not wipe the queue.
   const playStartedAtRef = useRef(0);

@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { getAlbumSongs, getArtistSongs, searchAlbums, searchArtists, searchSongs } from '../utils/jiosaavn';
-import { ArrowLeft, ChevronDown, ChevronUp, Disc3, Film, ListOrdered, Mic2, Music2, Plus, Trash2, X } from 'lucide-react';
+import { searchYouTube } from '../utils/youtube';
+import { ArrowLeft, ChevronDown, ChevronUp, Disc3, Film, ListOrdered, Mic2, Music2, Play, Plus, Trash2, X } from 'lucide-react';
 import { fetchMyStreams } from '../utils/api';
 import { Button, Panel, inputClass } from './ui';
 import { cn } from '../utils/cn';
@@ -23,6 +24,7 @@ export default function QueuePanel({ queue, canControl, participantId, people = 
   );
   const upNextIndex = currentIndex >= 0 ? currentIndex + 1 : 0;
   const [inputValue, setInputValue] = useState('');
+  const [searchSource, setSearchSource] = useState('music');
   const [searchMode, setSearchMode] = useState('songs');
   const [searchResults, setSearchResults] = useState([]);
   const [drilldown, setDrilldown] = useState(null);
@@ -74,9 +76,15 @@ export default function QueuePanel({ queue, canControl, participantId, people = 
       setSearching(true);
       try {
         let results = [];
-        if (searchMode === 'artists') results = await searchArtists(trimmed);
-        else if (searchMode === 'albums') results = await searchAlbums(trimmed);
-        else results = await searchSongs(trimmed);
+        if (searchSource === 'video') {
+          results = await searchYouTube(trimmed);
+        } else if (searchMode === 'artists') {
+          results = await searchArtists(trimmed);
+        } else if (searchMode === 'albums') {
+          results = await searchAlbums(trimmed);
+        } else {
+          results = await searchSongs(trimmed);
+        }
         setSearchResults(results);
         setDrilldown(null);
         setShowSearch(true);
@@ -89,7 +97,7 @@ export default function QueuePanel({ queue, canControl, participantId, people = 
       }
     }, 500);
     return () => window.clearTimeout(timer);
-  }, [inputValue, searchMode]);
+  }, [inputValue, searchMode, searchSource]);
 
   const handleSelectSong = async (song) => {
     setShowSearch(false);
@@ -110,6 +118,32 @@ export default function QueuePanel({ queue, canControl, participantId, people = 
         addedBy: participantId,
       });
       if (result?.duplicate) setError('This song is already in the queue.');
+    } catch (requestError) {
+      setError(requestError.message || 'Unable to add to the queue.');
+    } finally {
+      setAdding(false);
+    }
+  };
+
+  const handleSelectYouTube = async (video) => {
+    setShowSearch(false);
+    setInputValue('');
+    setSearchResults([]);
+    setDrilldown(null);
+    setError('');
+    setAdding(true);
+    try {
+      const result = await add({
+        kind: 'url',
+        url: video.videoUrl,
+        title: video.title,
+        author: video.artist,
+        thumbnailUrl: video.image,
+        type: 'video',
+        status: 'ready',
+        addedBy: participantId,
+      });
+      if (result?.duplicate) setError('This video is already in the queue.');
     } catch (requestError) {
       setError(requestError.message || 'Unable to add to the queue.');
     } finally {
@@ -231,33 +265,59 @@ export default function QueuePanel({ queue, canControl, participantId, people = 
 
       {canEdit ? (
         <div className="relative mt-3">
-          <div className="mb-2 flex flex-wrap gap-1.5">
-            {[
-              { id: 'songs', label: 'Songs', Icon: Music2 },
-              { id: 'artists', label: 'Artists', Icon: Mic2 },
-              { id: 'albums', label: 'Albums', Icon: Disc3 },
-            ].map(({ id, label, Icon }) => (
+          <div className="mb-2 flex flex-wrap items-center gap-2">
+            <div className="inline-flex rounded-md border border-zinc-200 bg-white p-0.5 dark:border-zinc-800 dark:bg-zinc-900">
               <button
-                key={id}
                 type="button"
-                onClick={() => { setSearchMode(id); setDrilldown(null); setSearchResults([]); }}
+                onClick={() => { setSearchSource('music'); setDrilldown(null); setSearchResults([]); }}
                 className={cn(
-                  'inline-flex items-center gap-1 rounded-md border px-2 py-1 text-2xs font-medium transition-colors sm:text-xs',
-                  searchMode === id
-                    ? 'border-indigo-200 bg-indigo-50 text-indigo-700 dark:border-indigo-900/50 dark:bg-indigo-950/30 dark:text-indigo-300'
-                    : 'border-zinc-200 bg-white text-zinc-600 hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800',
+                  'inline-flex items-center gap-1 rounded px-2.5 py-1 text-2xs font-medium sm:text-xs',
+                  searchSource === 'music' ? 'bg-indigo-50 text-indigo-700 dark:bg-indigo-950/30 dark:text-indigo-300' : 'text-zinc-600 hover:text-zinc-900 dark:text-zinc-300',
                 )}
               >
-                <Icon className="h-3 w-3 sm:h-3.5 sm:w-3.5" /> {label}
+                <Music2 className="h-3 w-3 sm:h-3.5 sm:w-3.5" /> Music
               </button>
-            ))}
+              <button
+                type="button"
+                onClick={() => { setSearchSource('video'); setDrilldown(null); setSearchResults([]); }}
+                className={cn(
+                  'inline-flex items-center gap-1 rounded px-2.5 py-1 text-2xs font-medium sm:text-xs',
+                  searchSource === 'video' ? 'bg-indigo-50 text-indigo-700 dark:bg-indigo-950/30 dark:text-indigo-300' : 'text-zinc-600 hover:text-zinc-900 dark:text-zinc-300',
+                )}
+              >
+                <Play className="h-3 w-3 sm:h-3.5 sm:w-3.5" /> Video
+              </button>
+            </div>
+            {searchSource === 'music' ? (
+              <div className="flex flex-wrap gap-1.5">
+                {[
+                  { id: 'songs', label: 'Songs', Icon: Music2 },
+                  { id: 'artists', label: 'Artists', Icon: Mic2 },
+                  { id: 'albums', label: 'Albums', Icon: Disc3 },
+                ].map(({ id, label, Icon }) => (
+                  <button
+                    key={id}
+                    type="button"
+                    onClick={() => { setSearchMode(id); setDrilldown(null); setSearchResults([]); }}
+                    className={cn(
+                      'inline-flex items-center gap-1 rounded-md border px-2 py-1 text-2xs font-medium transition-colors sm:text-xs',
+                      searchMode === id
+                        ? 'border-indigo-200 bg-indigo-50 text-indigo-700 dark:border-indigo-900/50 dark:bg-indigo-950/30 dark:text-indigo-300'
+                        : 'border-zinc-200 bg-white text-zinc-600 hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800',
+                    )}
+                  >
+                    <Icon className="h-3 w-3 sm:h-3.5 sm:w-3.5" /> {label}
+                  </button>
+                ))}
+              </div>
+            ) : null}
           </div>
           <form className="flex gap-2" onSubmit={handleAddUrl}>
             <input
               className={cn(inputClass, 'flex-1')}
               value={inputValue}
               onChange={(event) => setInputValue(event.target.value)}
-              placeholder={/^https?:\/\//i.test(inputValue.trim()) ? 'Paste a link or search...' : `Paste a link or search ${searchMode}...`}
+              placeholder={/^https?:\/\//i.test(inputValue.trim()) ? 'Paste a link or search...' : searchSource === 'video' ? 'Paste a link or search YouTube...' : `Paste a link or search ${searchMode}...`}
               aria-label="Queue video URL or search"
               disabled={adding}
             />
@@ -270,7 +330,31 @@ export default function QueuePanel({ queue, canControl, participantId, people = 
               {searching ? (
                 <div className="px-3 py-2 text-xs text-zinc-500">Loading…</div>
               ) : null}
-              {drilldown ? (
+              {searchSource === 'video' ? (
+                <>
+                  {searchResults.map((video) => (
+                    <button
+                      key={video.id}
+                      type="button"
+                      onClick={() => handleSelectYouTube(video)}
+                      className="flex w-full items-center gap-2 px-2.5 py-2 text-left text-xs hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                    >
+                      {video.image ? (
+                        <img src={video.image} alt="" loading="lazy" referrerPolicy="no-referrer" className="h-10 w-16 shrink-0 rounded object-cover aspect-video" />
+                      ) : (
+                        <div className="flex h-10 w-16 shrink-0 items-center justify-center rounded bg-zinc-100 text-zinc-400 aspect-video dark:bg-zinc-800"><Play className="h-4 w-4" /></div>
+                      )}
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate font-medium text-zinc-700 dark:text-zinc-200">{video.title}</p>
+                        <p className="truncate text-2xs text-zinc-500 dark:text-zinc-400">{video.artist}</p>
+                      </div>
+                    </button>
+                  ))}
+                  {!searching && !searchResults.length ? (
+                    <div className="px-3 py-2 text-xs text-zinc-500">No results.</div>
+                  ) : null}
+                </>
+              ) : drilldown ? (
                 <>
                   <div className="sticky top-0 flex items-center gap-2 border-b border-zinc-200/80 bg-white px-2 py-2 dark:border-zinc-800 dark:bg-zinc-900">
                     <button type="button" onClick={() => setDrilldown(null)} className="inline-flex items-center gap-1 text-xs text-zinc-600 hover:text-zinc-900 dark:text-zinc-300 dark:hover:text-zinc-100">
